@@ -1,0 +1,5 @@
+CLAUDE.md
+archive/
+*.stackdump
+ssh
+*.ini

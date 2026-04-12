@@ -1,0 +1,20 @@
+[Unit]
+Description=Raspberry Pi Wake-on-LAN Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# /boot/firmware/ (overlayfs 対象外・FAT32) から tmpfs にコピーして実行
+# これにより overlayfs 中でも update コマンドで更新が反映される
+ExecStartPre=/bin/bash -c 'BOOT=$([ -d /boot/firmware ] && echo /boot/firmware || echo /boot); cp "$BOOT/raspiwol.py" /tmp/raspiwol.py'
+ExecStart=/usr/bin/python3 /tmp/raspiwol.py
+Restart=always
+RestartSec=30
+User=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=raspiwol
+
+[Install]
+WantedBy=multi-user.target

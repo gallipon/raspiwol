@@ -1,0 +1,14 @@
+[mqtt]
+host = mqtt.beebotte.com
+port = 1883
+; Beebotte チャンネルトークン（token_XXXX 形式）
+token = token_XXXXXXXXXXXX
+; 購読するトピック（コマンド受信）
+topic_cmd = CHANNEL/RESOURCE
+; 送信するトピック（ログ・ステータス）
+topic_log = CHANNEL/log
+
+[update]
+; raspiwol.py の GitHub raw URL（"update" コマンドで取得）
+; 例: https://raw.githubusercontent.com/USER/raspiwol/main/raspiwol.py
+url =
