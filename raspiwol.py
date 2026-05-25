@@ -5,8 +5,10 @@ import configparser
 import csv
 import json
 import socket
+import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -28,6 +30,7 @@ MQTT_TOKEN = cfg.get("mqtt", "token",     fallback="")
 TOPIC_CMD  = cfg.get("mqtt", "topic_cmd", fallback="")
 TOPIC_LOG  = cfg.get("mqtt", "topic_log", fallback="")
 UPDATE_URL = cfg.get("update", "url",     fallback="")
+PWR_GPIO   = cfg.getint("gpio", "pwr_pin", fallback=17)
 
 # name (lowercase) → mac
 devices: dict[str, str] = {}
@@ -38,6 +41,45 @@ try:
                 devices[row[0].strip().lower()] = row[1].strip()
 except FileNotFoundError:
     print(f"WARNING: {DEVICES_FILE} not found", file=sys.stderr)
+
+
+# ── GPIO 電源ボタン ───────────────────────────────────────────────────────────
+
+try:
+    import RPi.GPIO as GPIO
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(PWR_GPIO, GPIO.IN)
+    _gpio_ok = True
+except Exception:
+    _gpio_ok = False
+
+_press_lock = threading.Lock()
+
+
+def _do_press(duration: float):
+    try:
+        GPIO.setup(PWR_GPIO, GPIO.OUT, initial=GPIO.LOW)
+        time.sleep(duration)
+    except Exception as e:
+        try:
+            pub(f"pwrbtn_error: {e}")
+        except Exception:
+            print(f"pwrbtn_error: {e}", file=sys.stderr)
+    finally:
+        try:
+            GPIO.setup(PWR_GPIO, GPIO.IN)
+        except Exception:
+            pass
+        _press_lock.release()
+
+
+def press_power_button(duration: float) -> str:
+    if not _gpio_ok:
+        return "unavailable"
+    if not _press_lock.acquire(blocking=False):
+        return "busy"
+    threading.Thread(target=_do_press, args=(duration,), daemon=True).start()
+    return "ok"
 
 
 # ── WOL ──────────────────────────────────────────────────────────────────────
@@ -137,6 +179,21 @@ def handle(data: str):
         subprocess.run(["reboot"])
         return
 
+    if cmd == "pwrbtn":
+        r = press_power_button(0.2)
+        pub({"ok": "pwrbtn: short (0.2s)", "busy": "pwrbtn: busy", "unavailable": "pwrbtn: gpio unavailable"}[r])
+        return
+
+    if cmd == "pwrbtn_long":
+        r = press_power_button(5.0)
+        pub({"ok": "pwrbtn: long (5s)", "busy": "pwrbtn: busy", "unavailable": "pwrbtn: gpio unavailable"}[r])
+        return
+
+    if cmd == "pwrbtn_10s":
+        r = press_power_button(10.0)
+        pub({"ok": "pwrbtn: 10s", "busy": "pwrbtn: busy", "unavailable": "pwrbtn: gpio unavailable"}[r])
+        return
+
     if cmd == "update":
         if not UPDATE_URL:
             pub("update_url not set in raspiwol.ini")
@@ -181,7 +238,20 @@ mq.on_connect = on_connect
 mq.on_message = on_message
 
 
+def _setup_signal_handler():
+    def _on_sigterm(signum, frame):
+        if _gpio_ok:
+            try:
+                GPIO.setup(PWR_GPIO, GPIO.IN)
+                GPIO.cleanup()
+            except Exception:
+                pass
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+
 def main():
+    _setup_signal_handler()
     print(f"raspiwol start | devices={list(devices.keys())} | ip={local_ip()}")
     while True:
         try:

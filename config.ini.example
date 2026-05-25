@@ -12,3 +12,7 @@ topic_log = CHANNEL/log
 ; raspiwol.py の GitHub raw URL（"update" コマンドで取得）
 ; 例: https://raw.githubusercontent.com/USER/raspiwol/main/raspiwol.py
 url =
+
+[gpio]
+; 電源ボタン用 GPIO ピン番号（BCM 番号、デフォルト 17 = 物理ピン 11）
+pwr_pin = 17
