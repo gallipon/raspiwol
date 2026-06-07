@@ -179,6 +179,12 @@ def handle(data: str):
         subprocess.run(["reboot"])
         return
 
+    if cmd == "shutdown":
+        pub("shutting down")
+        time.sleep(1)
+        subprocess.run(["shutdown", "-h", "now"])
+        return
+
     if cmd == "pwrbtn":
         r = press_power_button(0.2)
         pub({"ok": "pwrbtn: short (0.2s)", "busy": "pwrbtn: busy", "unavailable": "pwrbtn: gpio unavailable"}[r])
