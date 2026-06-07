@@ -29,7 +29,8 @@ MQTT_PORT  = cfg.getint("mqtt", "port",   fallback=1883)
 MQTT_TOKEN = cfg.get("mqtt", "token",     fallback="")
 TOPIC_CMD  = cfg.get("mqtt", "topic_cmd", fallback="")
 TOPIC_LOG  = cfg.get("mqtt", "topic_log", fallback="")
-UPDATE_URL = cfg.get("update", "url",     fallback="")
+UPDATE_URL          = cfg.get("update", "url",          fallback="")
+UPDATE_GITHUB_TOKEN = cfg.get("update", "github_token", fallback="")
 PWR_GPIO   = cfg.getint("gpio", "pwr_pin", fallback=17)
 
 # name (lowercase) → mac
@@ -208,7 +209,11 @@ def handle(data: str):
         tmp = SCRIPT_DEST.with_suffix(".tmp")
         try:
             remount_boot(rw=True)
-            urllib.request.urlretrieve(UPDATE_URL, tmp)
+            req = urllib.request.Request(UPDATE_URL)
+            if UPDATE_GITHUB_TOKEN:
+                req.add_header("Authorization", f"token {UPDATE_GITHUB_TOKEN}")
+            with urllib.request.urlopen(req) as resp:
+                tmp.write_bytes(resp.read())
             tmp.rename(SCRIPT_DEST)
             remount_boot(rw=False)
             pub("update: saved, restarting service")
