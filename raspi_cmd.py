@@ -2,11 +2,18 @@
 """raspiwol コマンド送信ツール: python3 raspi_cmd.py <command>"""
 
 import json
+import os
 import sys
 import time
 import paho.mqtt.client as mqtt
 
-TOKEN     = "token_E0E7ekAGNAb2Lz5d"
+TOKEN = os.environ.get("BEEBOTTE_TOKEN", "")
+if not TOKEN:
+    print("Error: 環境変数 BEEBOTTE_TOKEN を設定してください")
+    print("  export BEEBOTTE_TOKEN=token_XXXX  # Mac/Linux")
+    print("  $env:BEEBOTTE_TOKEN='token_XXXX'  # PowerShell")
+    sys.exit(1)
+
 TOPIC_CMD = "raspi3b/wol"
 TOPIC_LOG = "raspi3b/log"
 TIMEOUT   = 60  # 秒（update は再起動待ちがあるため長めに）
