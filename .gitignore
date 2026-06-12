@@ -1,5 +1,7 @@
 CLAUDE.md
+CLAUDE.local.md
 archive/
+local_docs/
 *.stackdump
 ssh
 *.ini
