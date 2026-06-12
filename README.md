@@ -2,6 +2,8 @@
 
 起動したい PC と同じ有線 LAN に Raspberry Pi 3B を設置し、外出先から MQTT (Beebotte) 経由で Wake-on-LAN マジックパケットを送信するデーモン。WOL が効かない完全シャットダウン時のために、GPIO からマザーボードの電源ボタンを直接操作するフォールバックも備える。
 
+> マイコン版（Wio Terminal / M5Stack Core）: [m5stackwol](https://github.com/gallipon/m5stackwol)
+
 ```
 スマホ / PC → Beebotte MQTT → Raspberry Pi 3B（有線LAN）→ WOL        → 対象PC
                                                           → GPIO 電源ボタン → 対象PC
