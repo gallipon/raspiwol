@@ -85,16 +85,23 @@ def press_power_button(duration: float) -> str:
 
 # ── WOL ──────────────────────────────────────────────────────────────────────
 
-def _local_broadcast() -> str:
+def _broadcasts() -> list[str]:
+    """全ての up な IPv4 インターフェースの broadcast を返す（255.255.255.255 含む）"""
+    addrs = ["255.255.255.255"]
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-        parts = ip.split(".")
-        parts[3] = "255"
-        return ".".join(parts)
-    except Exception:
-        return "192.168.0.255"
+        out = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show", "scope", "global"],
+            capture_output=True, text=True,
+        ).stdout
+        for line in out.splitlines():
+            f = line.split()
+            if "brd" in f:                      # 各 IF の実際の broadcast を採用（/23 等もOK）
+                brd = f[f.index("brd") + 1]
+                if brd not in addrs:
+                    addrs.append(brd)
+    except Exception as e:
+        print(f"_broadcasts error: {e}", file=sys.stderr)
+    return addrs
 
 
 def send_wol(mac: str) -> bool:
@@ -103,7 +110,7 @@ def send_wol(mac: str) -> bool:
         magic = b"\xff" * 6 + mac_bytes * 16
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            for addr in ["255.255.255.255", _local_broadcast()]:
+            for addr in _broadcasts():
                 s.sendto(magic, (addr, 9))
         return True
     except Exception as e:
