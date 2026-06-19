@@ -6,6 +6,7 @@ import csv
 import json
 import socket
 import signal
+import ssl
 import subprocess
 import sys
 import threading
@@ -185,6 +186,13 @@ def pub(msg: str):
     print(f"PUB: {msg}")
 
 
+# 会社網の TLS 検査（中間者）で api.beebotte.com の証明書検証が通らないため、
+# 自分のステータスを書くだけの bbt_write では証明書検証を無効化する（curl -k 相当）
+_SSL_NOVERIFY = ssl.create_default_context()
+_SSL_NOVERIFY.check_hostname = False
+_SSL_NOVERIFY.verify_mode = ssl.CERT_NONE
+
+
 def bbt_write(resource: str, value: str):
     """Beebotte REST API で値を永続化（ダッシュボードが GET read で取得する）"""
     if not CHANNEL or not MQTT_TOKEN:
@@ -197,7 +205,7 @@ def bbt_write(resource: str, value: str):
         )
         req.add_header("X-Auth-Token", MQTT_TOKEN)
         req.add_header("Content-Type", "application/json")
-        urllib.request.urlopen(req, timeout=5)
+        urllib.request.urlopen(req, timeout=5, context=_SSL_NOVERIFY)
     except Exception as e:
         print(f"bbt_write error: {e}", file=sys.stderr)
 
