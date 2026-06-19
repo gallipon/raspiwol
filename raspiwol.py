@@ -138,6 +138,25 @@ def uptime_str() -> str:
         return "unknown"
 
 
+def _valid_ipv4(s: str) -> bool:
+    parts = s.split(".")
+    return len(parts) == 4 and all(
+        p.isdigit() and 0 <= int(p) <= 255 for p in parts
+    )
+
+
+def ping_host(ip: str) -> bool:
+    """対象 IP に ICMP echo を1発投げ、応答すれば True（起動・稼働中の判定）"""
+    try:
+        r = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", ip],
+            capture_output=True,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 # ── /boot/firmware の一時的な書き込み許可 ─────────────────────────────────────
 
 def remount_boot(rw: bool):
@@ -179,6 +198,17 @@ def handle(data: str):
 
     if cmd == "status":
         pub(f"ip={local_ip()} uptime={uptime_str()} devices={list(devices.keys())}")
+        return
+
+    # ping <ip>: 対象PCの電源/稼働状態を確認（ダッシュボードのステータス表示用）
+    if cmd.startswith("ping"):
+        parts = cmd.split()
+        if len(parts) >= 2 and _valid_ipv4(parts[1]):
+            ip = parts[1]
+            up = ping_host(ip)
+            pub(f"ping: {ip} {'up' if up else 'down'}")
+        else:
+            pub("ping: bad_ip")
         return
 
     if cmd == "reboot":
