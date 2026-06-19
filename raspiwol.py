@@ -33,6 +33,11 @@ UPDATE_URL          = cfg.get("update", "url",          fallback="")
 UPDATE_GITHUB_TOKEN = cfg.get("update", "github_token", fallback="")
 PWR_GPIO   = cfg.getint("gpio", "pwr_pin", fallback=17)
 
+# Beebotte REST API（ダッシュボードが read するステータスの永続化に使用）
+API_BASE       = "https://api.beebotte.com/v1/data"
+CHANNEL        = TOPIC_CMD.split("/")[0] if "/" in TOPIC_CMD else ""
+POWER_RESOURCE = "power"   # ※Beebotte チャンネルに事前に作成しておくこと
+
 # name (lowercase) → mac
 devices: dict[str, str] = {}
 try:
@@ -180,6 +185,23 @@ def pub(msg: str):
     print(f"PUB: {msg}")
 
 
+def bbt_write(resource: str, value: str):
+    """Beebotte REST API で値を永続化（ダッシュボードが GET read で取得する）"""
+    if not CHANNEL or not MQTT_TOKEN:
+        return
+    try:
+        req = urllib.request.Request(
+            f"{API_BASE}/write/{CHANNEL}/{resource}",
+            data=json.dumps({"data": value}).encode(),
+            method="POST",
+        )
+        req.add_header("X-Auth-Token", MQTT_TOKEN)
+        req.add_header("Content-Type", "application/json")
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"bbt_write error: {e}", file=sys.stderr)
+
+
 def handle(data: str):
     cmd = data.strip().lower()
 
@@ -205,8 +227,9 @@ def handle(data: str):
         parts = cmd.split()
         if len(parts) >= 2 and _valid_ipv4(parts[1]):
             ip = parts[1]
-            up = ping_host(ip)
-            pub(f"ping: {ip} {'up' if up else 'down'}")
+            state = "up" if ping_host(ip) else "down"
+            pub(f"ping: {ip} {state}")
+            bbt_write(POWER_RESOURCE, state)   # ダッシュボード read 用に永続化
         else:
             pub("ping: bad_ip")
         return

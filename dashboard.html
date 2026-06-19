@@ -15,13 +15,9 @@
     background: #15171c; color: #e8eaed; padding: 24px;
   }
   h1 { font-size: 18px; font-weight: 600; margin: 0; color: #9aa0a6; }
-  .status {
-    display: flex; align-items: center; gap: 12px;
-    font-size: 22px; font-weight: 600;
-  }
+  .status { display: flex; align-items: center; gap: 12px; font-size: 22px; font-weight: 600; }
   .dot {
-    width: 18px; height: 18px; border-radius: 50%;
-    background: #5f6368; box-shadow: 0 0 0 0 rgba(0,0,0,0);
+    width: 18px; height: 18px; border-radius: 50%; background: #5f6368;
     transition: background .3s, box-shadow .3s;
   }
   .dot.up   { background: #34a853; box-shadow: 0 0 12px 2px rgba(52,168,83,.6); }
@@ -61,22 +57,23 @@
   </div>
 
   <div class="meta">
-    <span id="conn">接続中…</span><br>
+    <span id="conn"></span><br>
     target <span id="ip"></span>
   </div>
 
   <div id="log"></div>
 
-<script src="https://beebotte.com/bbt.min.js"></script>
 <script>
 // ── 設定 ───────────────────────────────────────────────────────────────────
+var API       = "https://api.beebotte.com/v1/data";
 var CHANNEL   = "raspi3b";
-var CMD_RES   = "wol";          // コマンド送信先リソース（raspi3b/wol）
-var LOG_RES   = "log";          // ステータス受信リソース（raspi3b/log）
+var CMD_RES   = "wol";          // コマンド送信先（raspi3b/wol）
+var POWER_RES = "power";        // ステータス受信元（raspi3b/power）※Beebotteに作成要
 var TARGET_IP = "192.168.11.49"; // 会社 desktopmuk の固定 IP（ping 対象）
 var WAKE_CMD  = "desktopmuk";   // WOL マジックパケット送信
-var SLEEP_CMD = "pwrbtn";       // GPIO 電源ボタン短押し（Windows 側で「電源ボタン=スリープ」設定が前提）
-var POLL_MS   = 8000;           // ステータス自動更新間隔
+var SLEEP_CMD = "pwrbtn";       // GPIO 電源ボタン短押し（Windows「電源ボタン=スリープ」前提）
+var POLL_MS   = 12000;          // ステータス更新間隔
+var REPLY_MS  = 2000;           // ping 送信→Pi の write 完了を待つ猶予
 
 // トークンは URL ハッシュで渡す:  dashboard.html#token_XXXXXXXX
 var TOKEN = decodeURIComponent((location.hash || "").replace(/^#/, "").trim());
@@ -91,15 +88,10 @@ document.getElementById("ip").textContent = TARGET_IP;
 
 function logLine(s) {
   var el = document.getElementById("log");
-  var t = new Date().toLocaleTimeString();
-  el.textContent += "[" + t + "] " + s + "\n";
+  el.textContent += "[" + new Date().toLocaleTimeString() + "] " + s + "\n";
   el.scrollTop = el.scrollHeight;
 }
-
-function setStatus(state, text) {
-  dot.className = "dot " + state;   // up / down / wait
-  label.textContent = text;
-}
+function setStatus(state, text) { dot.className = "dot " + state; label.textContent = text; }
 
 if (!TOKEN) {
   setStatus("down", "トークン未設定");
@@ -108,52 +100,63 @@ if (!TOKEN) {
   throw new Error("no token");
 }
 
-// ── Beebotte 接続 ───────────────────────────────────────────────────────────
-var bbt = new BBT(TOKEN, { ssl: true });
-
-// Beebotte のメッセージは {data: ...} で包まれる場合があるので剥がす
-function unwrap(msg) {
-  var d = msg;
-  for (var i = 0; i < 2; i++) {
-    if (d && typeof d === "object" && "data" in d) d = d.data; else break;
-  }
-  return d;
-}
-
-bbt.subscribe({ channel: CHANNEL, resource: LOG_RES }, function (msg) {
-  var d = unwrap(msg);
-  if (typeof d !== "string") return;
-  logLine(d);
-  // "ping: 192.168.11.49 up" / "... down" を拾ってステータス更新
-  var m = d.match(/^ping:\s*(\S+)\s+(up|down)$/);
-  if (m && m[1] === TARGET_IP) {
-    if (m[2] === "up") setStatus("up", "ON");
-    else               setStatus("down", "OFF");
-  }
-});
-
-conn.textContent = "接続済み";
-
+// ── Beebotte REST ───────────────────────────────────────────────────────────
 function publish(cmd) {
-  bbt.publish({ channel: CHANNEL, resource: CMD_RES, data: cmd });
   logLine("→ " + cmd);
+  return fetch(API + "/publish/" + CHANNEL + "/" + CMD_RES, {
+    method: "POST",
+    headers: { "X-Auth-Token": TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify({ data: cmd })
+  }).then(function (r) {
+    if (!r.ok) logLine("publish 失敗 HTTP " + r.status);
+    return r;
+  }).catch(function (e) { logLine("publish エラー: " + e.message); });
 }
 
-// ── ステータス自動ポーリング ────────────────────────────────────────────────
-function poll() { publish("ping " + TARGET_IP); }
-poll();
-setInterval(poll, POLL_MS);
+function readPower() {
+  return fetch(API + "/read/" + CHANNEL + "/" + POWER_RES + "?limit=1", {
+    headers: { "X-Auth-Token": TOKEN }
+  }).then(function (r) {
+    if (r.status === 404) {
+      setStatus("wait", "未設定");
+      conn.textContent = "Beebotte に power リソースを作成してください";
+      return null;
+    }
+    return r.json();
+  });
+}
+
+// ── ステータス更新 ──────────────────────────────────────────────────────────
+function refresh() {
+  if (document.hidden) return;          // 非表示タブでは API を叩かない
+  publish("ping " + TARGET_IP);
+  setTimeout(function () {
+    readPower().then(function (arr) {
+      if (!Array.isArray(arr) || !arr[0]) return;
+      var v = arr[0].data;
+      logLine("power = " + v);
+      if (v === "up")   { setStatus("up", "ON");  conn.textContent = "接続OK"; }
+      else if (v === "down") { setStatus("down", "OFF"); conn.textContent = "接続OK"; }
+    }).catch(function (e) { logLine("read エラー: " + e.message); });
+  }, REPLY_MS);
+}
+
+refresh();
+setInterval(refresh, POLL_MS);
+document.addEventListener("visibilitychange", function () { if (!document.hidden) refresh(); });
 
 // ── ボタン ──────────────────────────────────────────────────────────────────
 wakeB.addEventListener("click", function () {
   publish(WAKE_CMD);
   setStatus("wait", "起動中…");
+  setTimeout(refresh, 6000);
 });
 
 sleepB.addEventListener("click", function () {
   if (!confirm("desktopmuk をスリープさせますか？")) return;
   publish(SLEEP_CMD);
   setStatus("wait", "スリープ中…");
+  setTimeout(refresh, 6000);
 });
 </script>
 </body>
