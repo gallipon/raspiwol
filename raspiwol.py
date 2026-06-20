@@ -186,8 +186,10 @@ def pub(msg: str):
     print(f"PUB: {msg}")
 
 
-# 会社網の TLS 検査（中間者）で api.beebotte.com の証明書検証が通らないため、
-# 自分のステータスを書くだけの bbt_write では証明書検証を無効化する（curl -k 相当）
+# api.beebotte.com への HTTPS が CERTIFICATE_VERIFY_FAILED（unable to get local issuer
+# certificate）になるため検証を無効化（curl -k 相当）。原因は未確定で、Pi の CA バンドルが
+# 古い or Beebotte サーバが中間証明書を送っていない可能性（GitHub への HTTPS は通る）。
+# ステータスを書くだけの内部用途なので無効化を許容。ca-certificates 更新で正攻法に直せるかも。
 _SSL_NOVERIFY = ssl.create_default_context()
 _SSL_NOVERIFY.check_hostname = False
 _SSL_NOVERIFY.verify_mode = ssl.CERT_NONE

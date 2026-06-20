@@ -127,8 +127,11 @@ function readPower() {
 }
 
 // ── ステータス更新 ──────────────────────────────────────────────────────────
+// 前面タブ かつ ウィンドウにフォーカスがある時だけ叩く（別アプリ作業中・別タブ・最小化では止める）
+function active() { return !document.hidden && document.hasFocus(); }
+
 function refresh() {
-  if (document.hidden) return;          // 非表示タブでは API を叩かない
+  if (!active()) return;                 // 非表示 or 非フォーカスでは API を叩かない
   publish("ping " + TARGET_IP);
   setTimeout(function () {
     readPower().then(function (arr) {
@@ -143,7 +146,8 @@ function refresh() {
 
 refresh();
 setInterval(refresh, POLL_MS);
-document.addEventListener("visibilitychange", function () { if (!document.hidden) refresh(); });
+document.addEventListener("visibilitychange", function () { if (active()) refresh(); });
+window.addEventListener("focus", refresh);   // ブラウザに戻ったら即更新
 
 // ── ボタン ──────────────────────────────────────────────────────────────────
 wakeB.addEventListener("click", function () {
