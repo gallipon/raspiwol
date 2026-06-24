@@ -16,6 +16,14 @@ from pathlib import Path
 
 import paho.mqtt.client as mqtt
 
+# systemd 配下では stdout がブロックバッファになり journalctl にログが出ない/遅延する。
+# 行バッファ化して print() を即時 journald に流す（デバッグ可視性のため）。
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 # /boot/firmware (Bookworm) or /boot (Bullseye)
 BOOT_DIR = Path("/boot/firmware") if Path("/boot/firmware").exists() else Path("/boot")
 CONFIG_FILE = BOOT_DIR / "raspiwol.ini"
@@ -33,6 +41,10 @@ TOPIC_LOG  = cfg.get("mqtt", "topic_log", fallback="")
 UPDATE_URL          = cfg.get("update", "url",          fallback="")
 UPDATE_GITHUB_TOKEN = cfg.get("update", "github_token", fallback="")
 PWR_GPIO   = cfg.getint("gpio", "pwr_pin", fallback=17)
+# 短押し(pwrbtn)の長さ。長いと PC が S3 に入った後も押下が続き「同じ押下で起こし返す」
+# (powercfg /lastwake=電源ボタン)現象が起きる。S3 に入る前に離せるよう短く（既定 0.1s）。
+# 短すぎて押下が認識されない場合は raspiwol.ini の [gpio] short_sec で微調整。
+PWR_SHORT  = cfg.getfloat("gpio", "short_sec", fallback=0.1)
 
 # Beebotte REST API（ダッシュボードが read するステータスの永続化に使用）
 API_BASE       = "https://api.beebotte.com/v1/data"
@@ -257,8 +269,8 @@ def handle(data: str):
         return
 
     if cmd == "pwrbtn":
-        r = press_power_button(0.2)
-        pub({"ok": "pwrbtn: short (0.2s)", "busy": "pwrbtn: busy", "unavailable": "pwrbtn: gpio unavailable"}[r])
+        r = press_power_button(PWR_SHORT)
+        pub({"ok": f"pwrbtn: short ({PWR_SHORT}s)", "busy": "pwrbtn: busy", "unavailable": "pwrbtn: gpio unavailable"}[r])
         return
 
     if cmd == "pwrbtn_long":

@@ -70,8 +70,9 @@ var CHANNEL   = "raspi3b";
 var CMD_RES   = "wol";          // コマンド送信先（raspi3b/wol）
 var POWER_RES = "power";        // ステータス受信元（raspi3b/power）※Beebotteに作成要
 var TARGET_IP = "192.168.11.49"; // 会社 desktopmuk の固定 IP（ping 対象）
-var WAKE_CMD  = "desktopmuk";   // WOL マジックパケット送信
-var SLEEP_CMD = "pwrbtn";       // GPIO 電源ボタン短押し（Windows「電源ボタン=スリープ」前提）
+var SLEEP_RES = "pcsleep";      // PC スリープ指示先（raspi3b/pcsleep）→ PC 常駐エージェントが購読
+var WAKE_CMD  = "desktopmuk";   // WOL マジックパケット送信（raspi3b/wol へ）
+var SLEEP_CMD = "sleep";        // PC エージェントが解釈するスリープ指示（SetSuspendState）
 var POLL_MS   = 12000;          // ステータス更新間隔
 var REPLY_MS  = 2000;           // ping 送信→Pi の write 完了を待つ猶予
 
@@ -101,9 +102,11 @@ if (!TOKEN) {
 }
 
 // ── Beebotte REST ───────────────────────────────────────────────────────────
-function publish(cmd) {
-  logLine("→ " + cmd);
-  return fetch(API + "/publish/" + CHANNEL + "/" + CMD_RES, {
+// res 省略時は CMD_RES(wol) へ。Sleep だけ別リソース(pcsleep)に送るため res を取る。
+function publish(cmd, res) {
+  res = res || CMD_RES;
+  logLine("→ " + res + ": " + cmd);
+  return fetch(API + "/publish/" + CHANNEL + "/" + res, {
     method: "POST",
     headers: { "X-Auth-Token": TOKEN, "Content-Type": "application/json" },
     body: JSON.stringify({ data: cmd })
@@ -158,7 +161,7 @@ wakeB.addEventListener("click", function () {
 
 sleepB.addEventListener("click", function () {
   if (!confirm("desktopmuk をスリープさせますか？")) return;
-  publish(SLEEP_CMD);
+  publish(SLEEP_CMD, SLEEP_RES);   // pcsleep リソースへ "sleep" → PC エージェントが実行
   setStatus("wait", "スリープ中…");
   setTimeout(refresh, 6000);
 });
