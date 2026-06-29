@@ -175,6 +175,58 @@ def ping_host(ip: str) -> bool:
         return False
 
 
+def _interfaces() -> list[str]:
+    """インターネット上りの物理 IF 名（eth0, wlan0 等）。tailscale0 等の
+    仮想/トンネル IF はそこから外部到達できず疎通指標にならないので除外する。"""
+    skip = ("tailscale", "wg", "tun", "tap", "docker", "veth", "br-")
+    names: list[str] = []
+    try:
+        out = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show", "scope", "global"],
+            capture_output=True, text=True,
+        ).stdout
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) >= 2 and f[1] not in names and not f[1].startswith(skip):
+                names.append(f[1])
+    except Exception as e:
+        print(f"_interfaces error: {e}", file=sys.stderr)
+    return names
+
+
+def ping_via(ifname: str, ip: str = "8.8.8.8") -> bool:
+    """指定インターフェース経由で外部へ ICMP echo（経路ごとの疎通を切り分ける）。
+    2発投げ1発でも応答すれば up。1発・1秒だと省電力で寝た WiFi(wlan0)の起床に
+    間に合わず誤って down と出るため（初回パケットが遅延）、起床のもたつきを吸収する。"""
+    try:
+        r = subprocess.run(
+            ["ping", "-I", ifname, "-c", "2", "-W", "2", ip],
+            capture_output=True,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def tailscale_state() -> str | None:
+    """Tailscale バックエンドの状態（running/needslogin/stopped 等）を小文字で返す。
+    out-of-band 救済経路の健全性指標。ping ではなく接続状態で見るのが正しい
+    （tailscale0 は外部到達できず ping は無意味）。未導入なら None（netcheck で項目を出さない）。"""
+    try:
+        r = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return "down"
+    try:
+        return json.loads(r.stdout).get("BackendState", "?").lower()
+    except Exception:
+        return "down"
+
+
 # ── /boot/firmware の一時的な書き込み許可 ─────────────────────────────────────
 
 def remount_boot(rw: bool):
@@ -254,6 +306,16 @@ def handle(data: str):
             bbt_write(POWER_RESOURCE, state)   # ダッシュボード read 用に永続化
         else:
             pub("ping: bad_ip")
+        return
+
+    # netcheck: 各インターフェース経由で外部疎通を確認（eth0/wlan0 のどちらが死んだか切り分け）
+    # ＋ out-of-band 救済経路 Tailscale の接続状態（導入時のみ tailscale=running 等を付加）
+    if cmd == "netcheck":
+        parts = [f"{i}={'up' if ping_via(i) else 'down'}" for i in _interfaces()]
+        ts = tailscale_state()
+        if ts is not None:
+            parts.append(f"tailscale={ts}")
+        pub(f"netcheck: {' '.join(parts) or 'no interfaces'}")
         return
 
     if cmd == "reboot":
