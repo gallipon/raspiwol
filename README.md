@@ -24,7 +24,7 @@
                 ┌─────────────────────────── Beebotte (MQTT 1883 / REST 443) ───────────────────────────┐
                 │                                                                                        │
  [スマホ/PC]    │   [VPS: Apache+HTTPS]                 [Raspberry Pi 3B / 会社有線LAN]        [対象PC]   │
-   dashboard ───┤── dashboard.html ──pub/read──┐   ┌── raspiwol.py (daemon) ──WOL─────────────→ desktopmuk
+   dashboard ───┤── dashboard.html ──pub/read──┐   ┌── raspiwol.py (daemon) ──WOL─────────────→ officepc
    (REST 443)   │                              ├───┤      ├ GPIO 電源ボタン ─────────────────→ (PWR_SW)
                 │   slack_sleep_poll.php        │   │      ├ status / ping / netcheck
    勤怠 Slack ──┼── (cron, User Token) ──pub────┘   │      └ scheduled wake (平日 08:50 timer)
@@ -208,7 +208,7 @@ Beebotte のコマンドトピック（`raspi3b/wol`）に `{"data": "<コマン
 
 | data | 動作 |
 |---|---|
-| `"desktopmuk"` / `"macmini"` | WOL パケット送信（デバイス名は `raspiwol_devices.csv`） |
+| `"officepc"` / `"macmini"` | WOL パケット送信（デバイス名は `raspiwol_devices.csv`） |
 | `"pwrbtn"` | GPIO 電源ボタン 短押し（既定 0.1 秒・電源ON 用） |
 | `"pwrbtn_long"` | GPIO 電源ボタン 長押し 5秒（強制電源OFF） |
 | `"pwrbtn_10s"` | GPIO 電源ボタン 10秒押し（完全強制電源OFF） |
@@ -265,15 +265,15 @@ url = https://raw.githubusercontent.com/gallipon/raspiwol/main/raspiwol.py
 pwr_pin = 17        ; BCM 番号（既定 17 = 物理ピン 11）
 
 [wake]
-target = desktopmuk ; 平日朝の自動 Wake 対象（raspiwol_devices.csv の名前）
+target = officepc ; 平日朝の自動 Wake 対象（raspiwol_devices.csv の名前）
 ```
 
 デバイスリスト `/boot/firmware/raspiwol_devices.csv`（`devices.csv` 由来）:
 
 ```
 # name, mac
-desktopmuk, d8:bb:c1:df:91:36
-macmini, c8:2a:14:55:b0:65
+officepc, 00:11:22:33:44:55
+macmini, 00:11:22:33:44:66
 ```
 
 ---

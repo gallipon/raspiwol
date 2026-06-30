@@ -19,5 +19,5 @@ pwr_pin = 17
 
 [wake]
 ; 平日朝の自動 Wake（raspiwol-wake.timer → `raspiwol.py wake`）の対象デバイス名
-; （raspiwol_devices.csv の名前。未指定なら desktopmuk）
-target = desktopmuk
+; （raspiwol_devices.csv の名前。未指定なら officepc）
+target = officepc

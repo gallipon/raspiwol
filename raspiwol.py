@@ -51,7 +51,7 @@ API_BASE           = "https://api.beebotte.com/v1/data"
 CHANNEL            = TOPIC_CMD.split("/")[0] if "/" in TOPIC_CMD else ""
 POWER_RESOURCE     = "power"       # ※Beebotte チャンネルに事前に作成しておくこと
 AUTOPILOT_RESOURCE = "autopilot"   # ※同上。自動Wake/Sleep のマスタ ON/OFF スイッチ
-WAKE_TARGET = cfg.get("wake", "target", fallback="desktopmuk")  # 朝Wake の対象デバイス
+WAKE_TARGET = cfg.get("wake", "target", fallback="officepc")  # 朝Wake の対象デバイス
 
 # name (lowercase) → mac
 devices: dict[str, str] = {}

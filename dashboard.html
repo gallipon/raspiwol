@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<title>desktopmuk リモコン</title>
+<title>officepc リモコン</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -48,7 +48,7 @@
 </style>
 </head>
 <body>
-  <h1>desktopmuk リモコン</h1>
+  <h1>officepc リモコン</h1>
 
   <div class="status">
     <span id="dot" class="dot wait"></span>
@@ -78,10 +78,10 @@ var API       = "https://api.beebotte.com/v1/data";
 var CHANNEL   = "raspi3b";
 var CMD_RES   = "wol";          // コマンド送信先（raspi3b/wol）
 var POWER_RES = "power";        // ステータス受信元（raspi3b/power）※Beebotteに作成要
-var TARGET_IP = "192.168.11.49"; // 会社 desktopmuk の固定 IP（ping 対象）
+var TARGET_IP = "192.168.1.50"; // 対象 PC の固定 IP（ping 対象。デプロイ時に実IPへ）
 var SLEEP_RES = "pcsleep";      // PC スリープ指示先（raspi3b/pcsleep）→ PC 常駐エージェントが購読
 var AUTO_RES  = "autopilot";    // 自動Wake/Sleep のマスタースイッチ（raspi3b/autopilot）※Beebotteに作成要
-var WAKE_CMD  = "desktopmuk";   // WOL マジックパケット送信（raspi3b/wol へ）
+var WAKE_CMD  = "officepc";   // WOL マジックパケット送信（raspi3b/wol へ）
 var SLEEP_CMD = "sleep";        // PC エージェントが解釈するスリープ指示（SetSuspendState）
 var POLL_MS   = 12000;          // ステータス更新間隔
 var REPLY_MS  = 2000;           // ping 送信→Pi の write 完了を待つ猶予
@@ -175,7 +175,7 @@ wakeB.addEventListener("click", function () {
 });
 
 sleepB.addEventListener("click", function () {
-  if (!confirm("desktopmuk をスリープさせますか？")) return;
+  if (!confirm("officepc をスリープさせますか？")) return;
   publish(SLEEP_CMD, SLEEP_RES);   // pcsleep リソースへ "sleep" → PC エージェントが実行
   setStatus("wait", "スリープ中…");
   setTimeout(refresh, 6000);
