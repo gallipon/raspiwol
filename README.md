@@ -1,17 +1,52 @@
 # raspiwol
 
-起動したい PC と同じ有線 LAN に Raspberry Pi 3B を設置し、外出先から MQTT (Beebotte) 経由で Wake-on-LAN マジックパケットを送信するデーモン。WOL が効かない完全シャットダウン時のために、GPIO からマザーボードの電源ボタンを直接操作するフォールバックも備える。
+会社の有線 LAN に常設した Raspberry Pi 3B を踏み台に、**外出先から会社 PC を電源管理する**リモート運用システム。Wake-on-LAN による起動を軸に、確実なスリープ（PC 常駐エージェント）、スマホ/PC 用の Web ダッシュボード、平日スケジュール＋勤怠 Slack 連動の自動 Wake/Sleep、ネットワーク冗長化と out-of-band 復旧経路までを、**現地に行けるのは月数回**という制約のもとで「壊れない・遠隔で直せる」ことを最優先に設計している。
 
 > マイコン版（Wio Terminal / M5Stack Core）: [m5stackwol](https://github.com/gallipon/m5stackwol)
 
-```
-スマホ / PC → Beebotte MQTT → Raspberry Pi 3B（有線LAN）→ WOL        → 対象PC
-                                                          → GPIO 電源ボタン → 対象PC
-```
+---
+
+## 主な設計判断（Design highlights）
+
+- **SD カードを守る read-only root（overlayfs）** — 起動後の書き込みはすべて RAM。書き込み摩耗ゼロ・電源断でも壊れない。24時間運用×遠隔保守という前提への最適化。
+- **資格情報を持たせないスリープ設計** — PC を寝かせるのは「PC 自身」。Pi に SSH 鍵も PC のパスワードも置かない。PC 側エージェントは Beebotte への**アウトバウンド接続のみ**で、できるのは「自分を寝かせる」ことだけ。トークンが漏れても侵入経路にならない。
+- **デュアルホーム＋自動フェイルオーバー** — eth0（有線・主）と wlan0（ゲスト WiFi・予備）を冗長化し、インターネット経路を二重化。安定した有線を生命線に。
+- **out-of-band 復旧経路（Tailscale）** — eth0/VPN が落ちても tailnet 経由で Pi に到達。会社本網は tailnet に晒さない設定で導入。
+- **イベント駆動＋スケジュールの自動化** — 平日朝の自動 Wake（祝日・会社振替休日を判定）、終業後の idle スリープ、勤怠 Slack の「終了」投稿でのスリープ。全部を1つの**マスタースイッチ（autopilot）**で ON/OFF。
+- **会社網フレンドリー** — 非標準ポートが塞がれた環境を前提に、ダッシュボードは **Beebotte REST API（HTTPS 443・CORS 全開）** だけで動く1枚もの（外部ライブラリ不使用）。
+- **SSH 不要のリモート更新** — MQTT `update` で GitHub から自己更新。overlayfs 中でも `/boot/firmware`（FAT32）経由で永続化。
 
 ---
 
-## 設計方針：なぜ overlayfs（read-only root）か
+## アーキテクチャ
+
+```
+                ┌─────────────────────────── Beebotte (MQTT 1883 / REST 443) ───────────────────────────┐
+                │                                                                                        │
+ [スマホ/PC]    │   [VPS: Apache+HTTPS]                 [Raspberry Pi 3B / 会社有線LAN]        [対象PC]   │
+   dashboard ───┤── dashboard.html ──pub/read──┐   ┌── raspiwol.py (daemon) ──WOL─────────────→ desktopmuk
+   (REST 443)   │                              ├───┤      ├ GPIO 電源ボタン ─────────────────→ (PWR_SW)
+                │   slack_sleep_poll.php        │   │      ├ status / ping / netcheck
+   勤怠 Slack ──┼── (cron, User Token) ──pub────┘   │      └ scheduled wake (平日 08:50 timer)
+   「終了」     │                                   │
+                │   pcsleep_agent.py (PC 常駐) ──sub─┘   ← "sleep" 受信で SetSuspendState
+                │      └ idle/終業後 自動スリープ（autopilot 連動）
+                └────────────────────────────────────────────────────────────────────────────────────────┘
+        master switch: Beebotte "autopilot"（dashboard が write、Pi/PC が参照）
+        out-of-band: Pi に Tailscale（eth0 障害時も wlan0 経由で SSH 復旧）
+```
+
+| コンポーネント | 役割 | 動作環境 |
+|---|---|---|
+| `raspiwol.py` | MQTT デーモン本体（WOL・GPIO・診断・自己更新・平日朝 Wake） | Raspberry Pi 3B |
+| `dashboard.html` | 電源ステータス＋Wake/Sleep＋autopilot トグル（REST 直叩き・1枚もの） | VPS（静的配信） |
+| `pcsleep_agent.py` | PC 常駐。`sleep` 受信で SetSuspendState＋終業後 idle 自動スリープ | 対象 PC（Windows） |
+| `slack_sleep_poll.php` | 勤怠 Slack の「終了」投稿を拾って `sleep` を publish | VPS（cron） |
+| `raspiwol-wake.{service,timer}` | 平日 08:50 に `raspiwol.py wake` を起動 | Raspberry Pi 3B |
+
+---
+
+## なぜ overlayfs（read-only root）か
 
 この Pi は会社の有線 LAN に常時接続し、24時間つけっぱなしで運用する。一方で**現地に行けるのは月に数回**しかないため、「SD カードが突然壊れてリモートで何もできなくなる」事態を避けることが最優先になる。
 
@@ -22,8 +57,89 @@
 - 起動後の書き込みはすべて **RAM 上**に乗り、SD には一切書かれない → **書き込み摩耗ゼロ・電源断でも破損しない**
 - 代償として、稼働中に行った変更は**再起動で消える**（揮発）
 - 永続させたいもの（サービスコード・設定・デバイス一覧）は **`/boot/firmware`（FAT32・overlayfs 対象外）** に置く。普段は read-only、更新時だけ一時的に rw へ remount して書き込む（`update` コマンドや手動更新が自動で行う）
+- OS 設定（NetworkManager・systemd ユニット等）を永続させたい時は `overlayroot-chroot` でベース層（read-only 下層）を直接編集する
 
 結果として、**通常運用では SD への書き込みが発生しない**ため、カード寿命と停電耐性を最大化しつつ、コードはリモート（MQTT `update`）で更新できる構成になっている。
+
+---
+
+## リモートダッシュボード（dashboard.html）
+
+ブラウザから **Beebotte REST API（HTTPS 443）** に直接 fetch する1枚もの（外部ライブラリ不使用）。電源ステータス表示、Wake/Sleep ボタン、自動運転（autopilot）トグルを提供する。
+
+- **なぜ REST か**：会社網は非標準ポート（MQTT 1883/8883、WebSocket 8084 等）を塞いでおり、ブラウザからの MQTT-over-WS が通らない。Beebotte REST は **CORS 全開（`Access-Control-Allow-Origin: *`）かつ 443 のみ**で通るため、会社 PC でもスマホでも確実に動く（`file://` でも動作）。
+- **ステータス**：ページが `ping <PC_IP>` を publish → Pi が ping して結果を `power` リソースへ REST write → ページが read して 🟢ON / ⚫OFF 表示。前面タブかつフォーカス時のみポーリングし、Beebotte の無料メッセージ枠を節約。
+- **トークンの渡し方**：URL フラグメント（`dashboard.html#token_xxx`）。フラグメントはサーバへ送信されないため、VPS のアクセスログにも Referer にも残らない。
+- **デプロイ**：自前 VPS（Apache2 + Let's Encrypt HTTPS）の推測しにくいパス＋Basic 認証。ローカル PC が OFF でも iPad/Android から操作できる。
+
+---
+
+## 確実な PC スリープ（方式2：資格情報を Pi に置かない）
+
+当初は GPIO 電源ボタンの短押しで寝かせていたが、**S3 移行中に同じ押下が「起床トリガ」と誤認され、寝た直後に起き返す**現象が判明（`powercfg /lastwake` = 電源ボタン）。押下を短くしても安定しなかった。
+
+そこで **GPIO を使わず、PC 自身に `SetSuspendState` を実行させる方式2**へ移行した。
+
+- `pcsleep_agent.py`（PC 常駐）が Beebotte の `pcsleep` リソースを購読し、`"sleep"` 受信で `SetSuspendState(0,0,0)` を実行（スリープ。WOL 復帰可）。対話セッションで確実に動く。
+- **セキュリティ設計**：Pi に PC の資格情報（SSH 鍵・パスワード）を**一切置かない**。PC は Beebotte へ**アウトバウンド接続するだけ**で、できるのは「自分を寝かせる」ことのみ。トークンが漏れても侵入経路にならない（Pi から PC へ SSH する方式1より乗っ取り耐性が高い）。
+- **自動起動**：Windows タスクスケジューラ「ログオン時」＋「ユーザーがログオン中のみ実行」（対話セッション必須のため）。`pythonw.exe` で窓なし常駐。
+
+---
+
+## ネットワーク冗長化と Tailscale out-of-band 復旧
+
+Pi を eth0（会社有線）と wlan0（ゲスト WiFi）の**両方に接続**し、インターネット経路を冗長化している。
+
+| IF | 役割 | metric |
+|---|---|---|
+| eth0（有線） | **主**：PC 制御(WOL/ping)＋インターネット | 50 |
+| wlan0（WiFi） | **予備**：インターネットのバックアップ | 600 |
+
+- eth0 が落ちれば NetworkManager がメトリック差で wlan0 へ自動フェイルオーバー。**有線を生命線**にしたのは、ゲスト WiFi が「繋がっているのにインターネットだけ死ぬ」故障を起こしやすいため。
+- 予備リンクは即応すべきなので **wlan0 の WiFi 省電力を off** にしている（起床遅延で疎通判定が揺れるのを防ぐ）。
+- NetworkManager 設定は overlayfs（RAM）上にあるため、`overlayroot-chroot` でベース層に焼いて永続化している。
+
+**out-of-band 復旧（Tailscale）**：VPN は eth0 セグメントにしか繋がっておらず、eth0 が物理的に落ちると SSH できなくなる。そこで Pi に Tailscale を入れ、**tailnet 経由で eth0/VPN 非依存の到達経路**を確保した。
+
+- `--advertise-routes=`（空）で**サブネットルーティングを無効化**し、会社本網を tailnet に晒さない。
+- 認証済み状態をベース層へ焼いて reboot 後も同一ノードで自動復帰（auth key ローテーション不要）。
+- MagicDNS は `--accept-dns=false` で無効化（有効だと resolv.conf を乗っ取られ、公開名の解決ができなくなる落とし穴がある）。
+
+---
+
+## 平日 自動 Wake/Sleep ＋ マスタースイッチ
+
+平日の朝に PC を自動起動し、終業後にアイドルで自動スリープする。ON/OFF は Beebotte の **`autopilot` リソース（dashboard トグル＝単一の真実）**で一括制御する。
+
+- **朝 Wake（Pi）**：systemd timer（平日 08:50）→ `raspiwol.py wake`。出勤日判定に通り、かつ autopilot が ON のときだけ WOL を送る。
+  - **祝日判定は内閣府の祝日 CSV**（公式・国民の振替休日込み）を取得して行う＝**外部ライブラリ依存なし**。
+  - **会社固有ルール**：土曜に祝日が被ると翌月曜が振替休（祝日法には無いので独自に計算）。
+  - 年末年始など不定期の休みは autopilot を OFF にして対応（＝休暇・出張時も一括停止できる）。
+- **idle Sleep（PC）**：`pcsleep_agent.py` が 平日・終業時刻(19:00)以降・無操作30分（`GetLastInputInfo`）で自動スリープ。autopilot ON のときだけ。
+- **手動/Slack の Sleep は autopilot に関係なく常に有効**（明示的な操作は尊重する）。
+
+---
+
+## Slack 連携スリープ（不可視）
+
+勤怠チャンネルへ自分が「終了」を含む投稿をしたら、それを拾って PC をスリープさせる。
+
+- 勤怠チャンネルは全員が見るため、**Bot をチャンネルに参加させない**設計にした（Bot 参加は「追加」通知とメンバー表示が出てしまう）。
+- 代わりに **自分の User トークンで `conversations.history` を読むだけ**（チャンネルには何も表示されない）。VPS の cron が定期ポーリングし、自分の新規「終了」投稿を見つけたら `pcsleep` へ `"sleep"` を publish する。
+- 読み取り専用スコープ（`channels:history`）のみ。Beebotte 経由なので、ここでも「できるのは PC を寝かせることだけ」という設計が保たれる。
+
+---
+
+## 診断・運用
+
+| コマンド | 用途 |
+|---|---|
+| `status` | IP・稼働時間・デバイス一覧を返す |
+| `ping <ip>` | 対象 IP の死活確認（ダッシュボードの電源ステータス） |
+| `netcheck` | 各物理 IF(eth0/wlan0)経由の外部疎通＋Tailscale 接続状態を一度に確認（どの経路が死んだかの切り分け） |
+| `update` | GitHub から最新の `raspiwol.py` を取得してサービス再起動 |
+
+> **運用知見**：`update` は GitHub raw 取得のため、push 直後は CDN が旧版を数分キャッシュする。急ぐ時は `/tmp` 経由の SSH 手動配置（CDN 非経由・即時）を使う。
 
 ---
 
@@ -32,170 +148,106 @@
 | 項目 | 内容 |
 |---|---|
 | ハードウェア | Raspberry Pi 3B（有線 Ethernet 使用） |
-| OS | Raspberry Pi OS Lite (Bookworm 推奨) |
+| OS | Raspberry Pi OS Lite (Bookworm 以降) |
 | MQTT | Beebotte アカウント・チャンネル |
 | 電源 | USB-C ACアダプター（PCの電源に依存しないもの） |
 | GPIO 電源ボタン（任意） | 1kΩ 抵抗、ジャンパーワイヤー、ブレッドボード |
+| 拡張（任意） | VPS（ダッシュボード/Slack 連携）、Tailscale アカウント |
 
 ---
 
-## 初期セットアップ
+## 初期セットアップ（Pi コア）
 
 ### 1. Pi OS を SD カードに書き込む
 
 Raspberry Pi Imager で以下を設定してから書き込む:
-- OS: Raspberry Pi OS Lite (64-bit)
-- ホスト名: `raspi3b`
-- SSH: 有効
-- ユーザー名・パスワード: 任意
-- WiFi: 設定しない（有線のみ使用）
+- OS: Raspberry Pi OS Lite (64-bit) / ホスト名: `raspi3b` / SSH: 有効 / WiFi: 任意
 
-### 2. このリポジトリを Pi に転送する
-
-Pi と同じ LAN にいる PC から:
+### 2. このリポジトリを Pi に転送して setup.sh を実行する
 
 ```bash
 scp -r raspiwol/ USER@raspi3b.local:/home/USER/
+ssh USER@raspi3b.local
+cd /home/USER/raspiwol && sudo bash setup.sh
 ```
 
-### 3. setup.sh を実行する
+対話式で 静的 IP / ゲートウェイ / Beebotte トークン / トピック / update URL を入力する。
 
-Pi に SSH して:
-
-```bash
-cd /home/USER/raspiwol
-sudo bash setup.sh
-```
-
-対話式で以下を入力する:
-
-| 項目 | 例 |
-|---|---|
-| 静的 IP | `192.168.11.46` |
-| サブネット prefix | `24` |
-| ゲートウェイ | `192.168.11.1` |
-| DNS | （空欄でゲートウェイを使用） |
-| Beebotte トークン | `token_XXXXXXXXXXXX` |
-| コマンドトピック | `raspi3b/wol` |
-| ログトピック | `raspi3b/log` |
-| update URL | `https://raw.githubusercontent.com/gallipon/raspiwol/main/raspiwol.py` |
-
-### 4. overlayroot パッケージをインストールする
-
-setup.sh 完了後、**reboot 前に**インターネット接続がある状態で:
+### 3. overlayroot を入れて read-only 化する
 
 ```bash
-sudo apt install -y overlayroot
-```
-
-> setup.sh 内の `raspi-config nonint do_overlayfs 0` は overlayroot パッケージが必要。
-> インターネット接続がない状態で実行すると apt が失敗するため、手動でインストールする。
-
-### 5. cmdline.txt に overlayroot=tmpfs を追記する
-
-```bash
+sudo apt install -y overlayroot                                   # reboot 前に・ネット接続ありで
 sudo bash -c 'echo "overlayroot=tmpfs $(cat /boot/firmware/cmdline.txt)" > /boot/firmware/cmdline.txt'
-cat /boot/firmware/cmdline.txt  # 確認
-```
-
-### 6. 再起動する
-
-```bash
 sudo reboot
 ```
 
-### 7. 動作確認
+### 4. 動作確認
 
 ```bash
-# overlayfs が有効か確認
-mount | grep overlay
-
-# サービスログ確認
-sudo journalctl -u raspiwol -f
+mount | grep overlay            # overlayfs が有効か
+sudo journalctl -u raspiwol -f  # サービスログ
 ```
 
-Beebotte から `{"data": "status"}` を送信して応答が返れば完了。
+Beebotte から `{"data": "status"}` を送って応答が返れば完了。
+
+### 拡張コンポーネントの導入（任意）
+
+| 機能 | 概要 |
+|---|---|
+| ダッシュボード | `dashboard.html` を VPS に配置（Basic 認証推奨）。Beebotte に `power`・`autopilot` リソースを作成 |
+| PC スリープ | `pcsleep_agent.py` を PC に常駐（タスクスケジューラ・`pythonw`）。`BEEBOTTE_TOKEN` を環境変数に |
+| 自動 Wake | `raspiwol-wake.{service,timer}` を `/etc/systemd/system/` に置き timer を enable（overlayfs なら base 層へ永続化） |
+| Slack スリープ | `slack_sleep_poll.php` を VPS に配置し cron 登録。Slack の User Token（`channels:history`）が必要 |
 
 ---
 
 ## MQTT コマンド一覧
 
-Beebotte のチャンネルトピック（`raspi3b/wol`）に以下の JSON を送信する:
+Beebotte のコマンドトピック（`raspi3b/wol`）に `{"data": "<コマンド>"}` を送信する。応答は `raspi3b/log` に届く。
 
-| data フィールド | 動作 |
+| data | 動作 |
 |---|---|
-| `"desktopmuk"` | WOL パケット送信（デスクトップ PC） |
-| `"macmini"` | WOL パケット送信（Mac Mini） |
+| `"desktopmuk"` / `"macmini"` | WOL パケット送信（デバイス名は `raspiwol_devices.csv`） |
 | `"pwrbtn"` | GPIO 電源ボタン 短押し（既定 0.1 秒・電源ON 用） |
 | `"pwrbtn_long"` | GPIO 電源ボタン 長押し 5秒（強制電源OFF） |
 | `"pwrbtn_10s"` | GPIO 電源ボタン 10秒押し（完全強制電源OFF） |
-| `"status"` | IP・稼働時間・デバイス一覧を `raspi3b/log` に返信 |
-| `"update"` | GitHub から最新の raspiwol.py を取得してサービス再起動 |
-| `"reboot"` | Pi を再起動 |
+| `"status"` | IP・稼働時間・デバイス一覧を返信 |
+| `"ping <ip>"` | 指定 IP の死活確認（ダッシュボードの電源ステータス用） |
+| `"netcheck"` | 各 IF の外部疎通＋Tailscale 状態（`eth0=up wlan0=up tailscale=running`） |
+| `"update"` | GitHub から最新コードを取得してサービス再起動 |
+| `"reboot"` / `"shutdown"` | Pi を再起動 / シャットダウン |
 
-送信フォーマット:
-```json
-{"data": "status"}
-```
-
-応答は `raspi3b/log` トピックに届く。
+スリープ系は別リソースに送る：Web/Slack は `pcsleep` へ `"sleep"`（PC エージェントが実行）、自動運転の ON/OFF は `autopilot` へ `"on"/"off"`。
 
 ---
 
 ## GPIO 電源ボタン接続（任意）
 
-WOL が効かない場合（完全シャットダウン時など）の補完として、Raspberry Pi の GPIO をマザーボードの PWR_SW ヘッダに接続して電源ボタンを物理的に操作できる。
-
-### 必要部品
-
-- 1kΩ 抵抗 × 1
-- ジャンパーワイヤー（メス-メス、メス-オス）
-- ブレッドボード（小型可）
-
-### 配線
+WOL が効かない完全シャットダウン時の補完として、Pi の GPIO をマザーボードの PWR_SW ヘッダに接続し電源ボタンを物理操作できる。
 
 ```
 マザボ PWR_SW ─── 分岐 ┬── 元の電源ボタン（そのまま）
                         └── [1kΩ抵抗] ── Pi GPIO17 (物理ピン 11)
-
 マザボ GND ────── 分岐 ┬── 元の電源ボタン（そのまま）
                         └──────────────── Pi GND    (物理ピン 6)
 ```
 
-抵抗はブレッドボード上に挿し、ジャンパーワイヤーで橋渡しする。GND 側は抵抗不要。
-
-> **注意**: 対象 PC の PWR_SW スタンバイ電圧が 3.3V であることを確認すること。  
-> Z690 など現代のマザーボードはほぼ 3.3V。5V の場合は Pi GPIO が破損するおそれがある。
-
-### GPIO ピン番号の変更
-
-デフォルトは BCM17（物理ピン 11）。`raspiwol.ini` の `[gpio]` セクションで変更できる:
-
-```ini
-[gpio]
-pwr_pin = 27  ; BCM 番号で指定
-```
+> **注意**: 対象 PC の PWR_SW スタンバイ電圧が 3.3V であることを確認すること（5V だと Pi GPIO が破損するおそれ）。GPIO ピンは `raspiwol.ini` の `[gpio] pwr_pin`（BCM 番号）で変更可。
 
 ---
 
 ## コードの更新方法
 
-1. `raspiwol.py` を編集
-2. GitHub に push:
-   ```bash
-   git add raspiwol.py
-   git commit -m "変更内容"
-   git push
-   ```
-3. Beebotte から `{"data": "update"}` を送信
+1. `raspiwol.py` を編集して GitHub に push
+2. Beebotte から `{"data": "update"}` を送信 → Pi が自動でダウンロード・サービス再起動（SSH 不要）
 
-Pi が自動でダウンロード・サービス再起動する。SSH 不要。
+> push から数分は CDN キャッシュで旧版が返ることがある。即時反映したい時は SSH で `/boot/firmware/raspiwol.py` を手動配置する。
 
 ---
 
 ## 設定ファイル（Pi のみ・Git 管理外）
 
-`/boot/firmware/raspiwol.ini`:
+`/boot/firmware/raspiwol.ini`（トークンを含むため `.gitignore` 済み。テンプレートは `config.ini.example`）:
 
 ```ini
 [mqtt]
@@ -209,17 +261,13 @@ topic_log = raspi3b/log
 url = https://raw.githubusercontent.com/gallipon/raspiwol/main/raspiwol.py
 
 [gpio]
-; 電源ボタン用 GPIO ピン番号（BCM 番号、デフォルト 17 = 物理ピン 11）
-pwr_pin = 17
+pwr_pin = 17        ; BCM 番号（既定 17 = 物理ピン 11）
+
+[wake]
+target = desktopmuk ; 平日朝の自動 Wake 対象（raspiwol_devices.csv の名前）
 ```
 
-> `raspiwol.ini` はトークンを含むため Git に含めない（`.gitignore` 済み）。
-
----
-
-## デバイスリスト
-
-`/boot/firmware/raspiwol_devices.csv`（`devices.csv` から Pi にコピーされる）:
+デバイスリスト `/boot/firmware/raspiwol_devices.csv`（`devices.csv` 由来）:
 
 ```
 # name, mac
@@ -227,56 +275,32 @@ desktopmuk, d8:bb:c1:df:91:36
 macmini, c8:2a:14:55:b0:65
 ```
 
-デバイスを追加する場合は CSV を編集して Pi の `/boot/firmware/raspiwol_devices.csv` に上書きコピーする（overlayfs 環境では `/boot/firmware` は書き込み可）。
-
 ---
 
 ## トラブルシューティング
 
 ### MQTT に接続しない
-
 ```bash
-# 接続状態確認
 ss -tn | grep 1883
-
-# サービスログ確認
 sudo journalctl -u raspiwol -n 50
-```
-
-接続が確立していない場合はインターネット疎通を確認:
-```bash
 ping -c 3 8.8.8.8
+getent hosts mqtt.beebotte.com    # 名前解決の確認（Tailscale MagicDNS で壊れていないか）
 ```
 
-### /boot/firmware が read-only になっている
-
+### /boot/firmware が read-only
 ```bash
 sudo mount -o remount,rw /boot/firmware
 ```
 
-fstab に `ro` が残っている場合は削除:
-```bash
-sudo sed -i 's|defaults,ro|defaults|' /etc/fstab
-sudo systemctl daemon-reload
-```
-
 ### overlayfs が有効にならない
-
 ```bash
-# overlayroot パッケージの確認
 dpkg -l overlayroot
-
-# cmdline.txt の確認
-cat /boot/firmware/cmdline.txt
-# 先頭に overlayroot=tmpfs があること
-
-# 手動追記（まだない場合）
-sudo bash -c 'echo "overlayroot=tmpfs $(cat /boot/firmware/cmdline.txt)" > /boot/firmware/cmdline.txt'
+cat /boot/firmware/cmdline.txt    # 先頭に overlayroot=tmpfs があること
 ```
 
 ### SSH 接続先
-
 | 環境 | コマンド |
 |---|---|
 | 同一 LAN（mDNS） | `ssh USER@raspi3b.local` |
 | リモート（VPN 経由） | `ssh USER@<静的IP>` |
+| eth0 障害時など | `ssh USER@<Tailscale の 100.x>`（out-of-band） |
