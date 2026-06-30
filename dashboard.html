@@ -144,20 +144,24 @@ function readPower() {
 // 前面タブ かつ ウィンドウにフォーカスがある時だけ叩く（別アプリ作業中・別タブ・最小化では止める）
 function active() { return !document.hidden && document.hasFocus(); }
 
+function renderPower(arr) {
+  if (!Array.isArray(arr) || !arr[0]) return;
+  var v = arr[0].data;
+  logLine("power = " + v);
+  if (v === "up")        { setStatus("up", "ON");  conn.textContent = "接続OK"; }
+  else if (v === "down") { setStatus("down", "OFF"); conn.textContent = "接続OK"; }
+}
+
 function refresh() {
   if (!active()) return;                 // 非表示 or 非フォーカスでは API を叩かない
   publish("ping " + TARGET_IP);
   setTimeout(function () {
-    readPower().then(function (arr) {
-      if (!Array.isArray(arr) || !arr[0]) return;
-      var v = arr[0].data;
-      logLine("power = " + v);
-      if (v === "up")   { setStatus("up", "ON");  conn.textContent = "接続OK"; }
-      else if (v === "down") { setStatus("down", "OFF"); conn.textContent = "接続OK"; }
-    }).catch(function (e) { logLine("read エラー: " + e.message); });
+    readPower().then(renderPower).catch(function (e) { logLine("read エラー: " + e.message); });
   }, REPLY_MS);
 }
 
+// 初回は ping を待たず直近の power を即 read して last-known を表示（体感速度の改善）。
+readPower().then(renderPower).catch(function () {});
 refresh();
 setInterval(refresh, POLL_MS);
 document.addEventListener("visibilitychange", function () { if (active()) refresh(); });
