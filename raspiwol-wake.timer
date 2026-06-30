@@ -1,0 +1,12 @@
+[Unit]
+Description=Trigger raspiwol morning Wake on weekdays at 08:50 (begin work 09:00)
+
+[Timer]
+# 平日 08:50（始業9:00の10分前）。曜日のみ指定し、祝日/会社休日は
+# 起動側スクリプト(is_workday)で判定する。
+OnCalendar=Mon-Fri 08:50:00
+# Pi が起動していなかった時間帯の取りこぼしを後から実行しない（遅れて起こさない）
+Persistent=false
+
+[Install]
+WantedBy=timers.target

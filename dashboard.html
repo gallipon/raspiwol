@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<title>desktopmuk リモコン</title>
+<title>officepc リモコン</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -35,6 +35,10 @@
   .wake  { background: #1a73e8; }
   .sleep { background: #5f6368; }
   .meta { font-size: 12px; color: #80868b; text-align: center; line-height: 1.6; }
+  .autorow { display: flex; align-items: center; gap: 12px; font-size: 14px; color: #9aa0a6; }
+  .autobtn { padding: 10px 18px; min-width: 88px; border-radius: 14px; font-size: 15px; font-weight: 700; }
+  .autobtn.on  { background: #34a853; }
+  .autobtn.off { background: #5f6368; }
   #log {
     width: 100%; max-width: 380px; height: 96px; overflow-y: auto;
     background: #0e1014; border-radius: 10px; padding: 10px 12px;
@@ -44,7 +48,7 @@
 </style>
 </head>
 <body>
-  <h1>desktopmuk リモコン</h1>
+  <h1>officepc リモコン</h1>
 
   <div class="status">
     <span id="dot" class="dot wait"></span>
@@ -54,6 +58,11 @@
   <div class="buttons">
     <button id="wake"  class="wake">Wake</button>
     <button id="sleep" class="sleep">Sleep</button>
+  </div>
+
+  <div class="autorow">
+    <span>自動 Wake/Sleep</span>
+    <button id="auto" class="autobtn off">--</button>
   </div>
 
   <div class="meta">
@@ -69,9 +78,10 @@ var API       = "https://api.beebotte.com/v1/data";
 var CHANNEL   = "raspi3b";
 var CMD_RES   = "wol";          // コマンド送信先（raspi3b/wol）
 var POWER_RES = "power";        // ステータス受信元（raspi3b/power）※Beebotteに作成要
-var TARGET_IP = "192.168.11.49"; // 会社 desktopmuk の固定 IP（ping 対象）
+var TARGET_IP = "192.168.1.50"; // 対象 PC の固定 IP（ping 対象。デプロイ時に実IPへ）
 var SLEEP_RES = "pcsleep";      // PC スリープ指示先（raspi3b/pcsleep）→ PC 常駐エージェントが購読
-var WAKE_CMD  = "desktopmuk";   // WOL マジックパケット送信（raspi3b/wol へ）
+var AUTO_RES  = "autopilot";    // 自動Wake/Sleep のマスタースイッチ（raspi3b/autopilot）※Beebotteに作成要
+var WAKE_CMD  = "officepc";   // WOL マジックパケット送信（raspi3b/wol へ）
 var SLEEP_CMD = "sleep";        // PC エージェントが解釈するスリープ指示（SetSuspendState）
 var POLL_MS   = 12000;          // ステータス更新間隔
 var REPLY_MS  = 2000;           // ping 送信→Pi の write 完了を待つ猶予
@@ -85,6 +95,7 @@ var label = document.getElementById("label");
 var conn  = document.getElementById("conn");
 var wakeB = document.getElementById("wake");
 var sleepB= document.getElementById("sleep");
+var autoB = document.getElementById("auto");
 document.getElementById("ip").textContent = TARGET_IP;
 
 function logLine(s) {
@@ -97,7 +108,7 @@ function setStatus(state, text) { dot.className = "dot " + state; label.textCont
 if (!TOKEN) {
   setStatus("down", "トークン未設定");
   conn.textContent = "URL の末尾に #token_XXXX を付けて開いてください";
-  wakeB.disabled = sleepB.disabled = true;
+  wakeB.disabled = sleepB.disabled = autoB.disabled = true;
   throw new Error("no token");
 }
 
@@ -118,7 +129,7 @@ function publish(cmd, res) {
 
 function readPower() {
   return fetch(API + "/read/" + CHANNEL + "/" + POWER_RES + "?limit=1", {
-    headers: { "X-Auth-Token": TOKEN }
+    headers: { "X-Auth-Token": TOKEN }, cache: "no-store"
   }).then(function (r) {
     if (r.status === 404) {
       setStatus("wait", "未設定");
@@ -133,20 +144,24 @@ function readPower() {
 // 前面タブ かつ ウィンドウにフォーカスがある時だけ叩く（別アプリ作業中・別タブ・最小化では止める）
 function active() { return !document.hidden && document.hasFocus(); }
 
+function renderPower(arr) {
+  if (!Array.isArray(arr) || !arr[0]) return;
+  var v = arr[0].data;
+  logLine("power = " + v);
+  if (v === "up")        { setStatus("up", "ON");  conn.textContent = "接続OK"; }
+  else if (v === "down") { setStatus("down", "OFF"); conn.textContent = "接続OK"; }
+}
+
 function refresh() {
   if (!active()) return;                 // 非表示 or 非フォーカスでは API を叩かない
   publish("ping " + TARGET_IP);
   setTimeout(function () {
-    readPower().then(function (arr) {
-      if (!Array.isArray(arr) || !arr[0]) return;
-      var v = arr[0].data;
-      logLine("power = " + v);
-      if (v === "up")   { setStatus("up", "ON");  conn.textContent = "接続OK"; }
-      else if (v === "down") { setStatus("down", "OFF"); conn.textContent = "接続OK"; }
-    }).catch(function (e) { logLine("read エラー: " + e.message); });
+    readPower().then(renderPower).catch(function (e) { logLine("read エラー: " + e.message); });
   }, REPLY_MS);
 }
 
+// 初回は ping を待たず直近の power を即 read して last-known を表示（体感速度の改善）。
+readPower().then(renderPower).catch(function () {});
 refresh();
 setInterval(refresh, POLL_MS);
 document.addEventListener("visibilitychange", function () { if (active()) refresh(); });
@@ -160,11 +175,77 @@ wakeB.addEventListener("click", function () {
 });
 
 sleepB.addEventListener("click", function () {
-  if (!confirm("desktopmuk をスリープさせますか？")) return;
+  if (!confirm("officepc をスリープさせますか？")) return;
   publish(SLEEP_CMD, SLEEP_RES);   // pcsleep リソースへ "sleep" → PC エージェントが実行
   setStatus("wait", "スリープ中…");
   setTimeout(refresh, 6000);
 });
+
+// ── 自動 Wake/Sleep スイッチ（autopilot）──────────────────────────────────────
+// write（永続＋publish）で raspi3b/autopilot を更新 → Pi が朝Wake時に read、
+// PC 常駐エージェントが購読して idle Sleep の有効/無効に反映。Slack/手動 Sleep は不変。
+//
+// 表示の安定化: Beebotte は write→read の伝播にラグがあり、read が一時的に古い値を
+// 返すことがある。直近のローカル操作を localStorage に記録し、サーバ read が追いつく
+// まで（最大 LOCAL_TTL）はローカル値を優先表示する（リロードでも戻らない）。read 自体も
+// cache:"no-store" でブラウザのGETキャッシュを排除（URL は変えない＝Beebotte が未知の
+// クエリを 400 で弾くため、キャッシュバスター param は使わない）。
+var autoOn = true;
+var LOCAL_TTL = 60000;   // ローカル優先の有効期間(ms)
+function setAuto(on) {
+  autoOn = on;
+  autoB.className = "autobtn " + (on ? "on" : "off");
+  autoB.textContent = on ? "ON" : "OFF";
+}
+function localAuto() {
+  try { return JSON.parse(localStorage.getItem("autopilot_local") || "null"); }
+  catch (e) { return null; }
+}
+function saveLocal(on) {
+  try { localStorage.setItem("autopilot_local", JSON.stringify({ v: on ? "on" : "off", t: Date.now() })); }
+  catch (e) {}
+}
+function readAuto() {
+  return fetch(API + "/read/" + CHANNEL + "/" + AUTO_RES + "?limit=1", {
+    headers: { "X-Auth-Token": TOKEN }, cache: "no-store"
+  }).then(function (r) {
+    if (r.status === 404) { setAuto(true); return null; }   // 未設定は ON 既定
+    return r.json();
+  }).then(function (arr) {
+    var loc = localAuto();
+    var fresh = loc && (Date.now() - loc.t) < LOCAL_TTL;
+    if (Array.isArray(arr) && arr[0]) {
+      var srvTs = Number(arr[0].ts) || 0;
+      // サーバの最新 record がローカル操作より古い＝まだ追いついていない → ローカル維持
+      if (fresh && srvTs < loc.t) setAuto(loc.v === "on");
+      else setAuto(String(arr[0].data).toLowerCase() === "on");
+    } else if (fresh) {
+      setAuto(loc.v === "on");
+    }
+  }).catch(function (e) { logLine("auto read エラー: " + e.message); });
+}
+function writeAuto(on) {
+  var v = on ? "on" : "off";
+  logLine("→ " + AUTO_RES + ": " + v);
+  return fetch(API + "/write/" + CHANNEL + "/" + AUTO_RES, {
+    method: "POST",
+    headers: { "X-Auth-Token": TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify({ data: v })
+  }).then(function (r) { if (!r.ok) logLine("auto write 失敗 HTTP " + r.status); return r; })
+    .catch(function (e) { logLine("auto write エラー: " + e.message); });
+}
+autoB.addEventListener("click", function () {
+  var next = !autoOn;
+  setAuto(next);          // 楽観的に即反映
+  saveLocal(next);        // リロードでも戻らないようローカルに記録
+  writeAuto(next);
+});
+(function initAuto() {
+  var loc = localAuto();
+  if (loc && (Date.now() - loc.t) < LOCAL_TTL) setAuto(loc.v === "on");  // 即時にローカル値を表示
+  readAuto();                                                            // サーバと突き合わせ
+})();
+window.addEventListener("focus", readAuto);   // 別端末で変えた場合に追従
 </script>
 </body>
 </html>
