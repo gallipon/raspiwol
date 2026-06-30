@@ -35,6 +35,10 @@
   .wake  { background: #1a73e8; }
   .sleep { background: #5f6368; }
   .meta { font-size: 12px; color: #80868b; text-align: center; line-height: 1.6; }
+  .autorow { display: flex; align-items: center; gap: 12px; font-size: 14px; color: #9aa0a6; }
+  .autobtn { padding: 10px 18px; min-width: 88px; border-radius: 14px; font-size: 15px; font-weight: 700; }
+  .autobtn.on  { background: #34a853; }
+  .autobtn.off { background: #5f6368; }
   #log {
     width: 100%; max-width: 380px; height: 96px; overflow-y: auto;
     background: #0e1014; border-radius: 10px; padding: 10px 12px;
@@ -56,6 +60,11 @@
     <button id="sleep" class="sleep">Sleep</button>
   </div>
 
+  <div class="autorow">
+    <span>自動 Wake/Sleep</span>
+    <button id="auto" class="autobtn off">--</button>
+  </div>
+
   <div class="meta">
     <span id="conn"></span><br>
     target <span id="ip"></span>
@@ -71,6 +80,7 @@ var CMD_RES   = "wol";          // コマンド送信先（raspi3b/wol）
 var POWER_RES = "power";        // ステータス受信元（raspi3b/power）※Beebotteに作成要
 var TARGET_IP = "192.168.11.49"; // 会社 desktopmuk の固定 IP（ping 対象）
 var SLEEP_RES = "pcsleep";      // PC スリープ指示先（raspi3b/pcsleep）→ PC 常駐エージェントが購読
+var AUTO_RES  = "autopilot";    // 自動Wake/Sleep のマスタースイッチ（raspi3b/autopilot）※Beebotteに作成要
 var WAKE_CMD  = "desktopmuk";   // WOL マジックパケット送信（raspi3b/wol へ）
 var SLEEP_CMD = "sleep";        // PC エージェントが解釈するスリープ指示（SetSuspendState）
 var POLL_MS   = 12000;          // ステータス更新間隔
@@ -85,6 +95,7 @@ var label = document.getElementById("label");
 var conn  = document.getElementById("conn");
 var wakeB = document.getElementById("wake");
 var sleepB= document.getElementById("sleep");
+var autoB = document.getElementById("auto");
 document.getElementById("ip").textContent = TARGET_IP;
 
 function logLine(s) {
@@ -97,7 +108,7 @@ function setStatus(state, text) { dot.className = "dot " + state; label.textCont
 if (!TOKEN) {
   setStatus("down", "トークン未設定");
   conn.textContent = "URL の末尾に #token_XXXX を付けて開いてください";
-  wakeB.disabled = sleepB.disabled = true;
+  wakeB.disabled = sleepB.disabled = autoB.disabled = true;
   throw new Error("no token");
 }
 
@@ -165,6 +176,43 @@ sleepB.addEventListener("click", function () {
   setStatus("wait", "スリープ中…");
   setTimeout(refresh, 6000);
 });
+
+// ── 自動 Wake/Sleep スイッチ（autopilot）──────────────────────────────────────
+// write（永続＋publish）で raspi3b/autopilot を更新 → Pi が朝Wake時に read、
+// PC 常駐エージェントが購読して idle Sleep の有効/無効に反映。Slack/手動 Sleep は不変。
+var autoOn = true;
+function setAuto(on) {
+  autoOn = on;
+  autoB.className = "autobtn " + (on ? "on" : "off");
+  autoB.textContent = on ? "ON" : "OFF";
+}
+function readAuto() {
+  return fetch(API + "/read/" + CHANNEL + "/" + AUTO_RES + "?limit=1", {
+    headers: { "X-Auth-Token": TOKEN }
+  }).then(function (r) {
+    if (r.status === 404) { setAuto(true); return null; }   // 未設定は ON 既定
+    return r.json();
+  }).then(function (arr) {
+    if (Array.isArray(arr) && arr[0]) setAuto(String(arr[0].data).toLowerCase() === "on");
+  }).catch(function (e) { logLine("auto read エラー: " + e.message); });
+}
+function writeAuto(on) {
+  var v = on ? "on" : "off";
+  logLine("→ " + AUTO_RES + ": " + v);
+  return fetch(API + "/write/" + CHANNEL + "/" + AUTO_RES, {
+    method: "POST",
+    headers: { "X-Auth-Token": TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify({ data: v })
+  }).then(function (r) { if (!r.ok) logLine("auto write 失敗 HTTP " + r.status); return r; })
+    .catch(function (e) { logLine("auto write エラー: " + e.message); });
+}
+autoB.addEventListener("click", function () {
+  var next = !autoOn;
+  setAuto(next);          // 楽観的に即反映
+  writeAuto(next);
+});
+readAuto();
+window.addEventListener("focus", readAuto);   // 別端末で変えた場合に追従
 </script>
 </body>
 </html>
