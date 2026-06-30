@@ -128,8 +128,8 @@ function publish(cmd, res) {
 }
 
 function readPower() {
-  return fetch(API + "/read/" + CHANNEL + "/" + POWER_RES + "?limit=1", {
-    headers: { "X-Auth-Token": TOKEN }
+  return fetch(API + "/read/" + CHANNEL + "/" + POWER_RES + "?limit=1&_=" + Date.now(), {
+    headers: { "X-Auth-Token": TOKEN }, cache: "no-store"
   }).then(function (r) {
     if (r.status === 404) {
       setStatus("wait", "未設定");
@@ -180,20 +180,43 @@ sleepB.addEventListener("click", function () {
 // ── 自動 Wake/Sleep スイッチ（autopilot）──────────────────────────────────────
 // write（永続＋publish）で raspi3b/autopilot を更新 → Pi が朝Wake時に read、
 // PC 常駐エージェントが購読して idle Sleep の有効/無効に反映。Slack/手動 Sleep は不変。
+//
+// 表示の安定化: Beebotte は write→read の伝播にラグがあり、read が一時的に古い値を
+// 返すことがある。直近のローカル操作を localStorage に記録し、サーバ read が追いつく
+// まで（最大 LOCAL_TTL）はローカル値を優先表示する（リロードでも戻らない）。read 自体も
+// cache:"no-store"＋キャッシュバスターでブラウザのGETキャッシュを排除。
 var autoOn = true;
+var LOCAL_TTL = 60000;   // ローカル優先の有効期間(ms)
 function setAuto(on) {
   autoOn = on;
   autoB.className = "autobtn " + (on ? "on" : "off");
   autoB.textContent = on ? "ON" : "OFF";
 }
+function localAuto() {
+  try { return JSON.parse(localStorage.getItem("autopilot_local") || "null"); }
+  catch (e) { return null; }
+}
+function saveLocal(on) {
+  try { localStorage.setItem("autopilot_local", JSON.stringify({ v: on ? "on" : "off", t: Date.now() })); }
+  catch (e) {}
+}
 function readAuto() {
-  return fetch(API + "/read/" + CHANNEL + "/" + AUTO_RES + "?limit=1", {
-    headers: { "X-Auth-Token": TOKEN }
+  return fetch(API + "/read/" + CHANNEL + "/" + AUTO_RES + "?limit=1&_=" + Date.now(), {
+    headers: { "X-Auth-Token": TOKEN }, cache: "no-store"
   }).then(function (r) {
     if (r.status === 404) { setAuto(true); return null; }   // 未設定は ON 既定
     return r.json();
   }).then(function (arr) {
-    if (Array.isArray(arr) && arr[0]) setAuto(String(arr[0].data).toLowerCase() === "on");
+    var loc = localAuto();
+    var fresh = loc && (Date.now() - loc.t) < LOCAL_TTL;
+    if (Array.isArray(arr) && arr[0]) {
+      var srvTs = Number(arr[0].ts) || 0;
+      // サーバの最新 record がローカル操作より古い＝まだ追いついていない → ローカル維持
+      if (fresh && srvTs < loc.t) setAuto(loc.v === "on");
+      else setAuto(String(arr[0].data).toLowerCase() === "on");
+    } else if (fresh) {
+      setAuto(loc.v === "on");
+    }
   }).catch(function (e) { logLine("auto read エラー: " + e.message); });
 }
 function writeAuto(on) {
@@ -209,9 +232,14 @@ function writeAuto(on) {
 autoB.addEventListener("click", function () {
   var next = !autoOn;
   setAuto(next);          // 楽観的に即反映
+  saveLocal(next);        // リロードでも戻らないようローカルに記録
   writeAuto(next);
 });
-readAuto();
+(function initAuto() {
+  var loc = localAuto();
+  if (loc && (Date.now() - loc.t) < LOCAL_TTL) setAuto(loc.v === "on");  // 即時にローカル値を表示
+  readAuto();                                                            // サーバと突き合わせ
+})();
 window.addEventListener("focus", readAuto);   // 別端末で変えた場合に追従
 </script>
 </body>
