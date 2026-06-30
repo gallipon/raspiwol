@@ -127,6 +127,7 @@ Pi を eth0（会社有線）と wlan0（ゲスト WiFi）の**両方に接続**
 - 勤怠チャンネルは全員が見るため、**Bot をチャンネルに参加させない**設計にした（Bot 参加は「追加」通知とメンバー表示が出てしまう）。
 - 代わりに **自分の User トークンで `conversations.history` を読むだけ**（チャンネルには何も表示されない）。VPS の cron が定期ポーリングし、自分の新規「終了」投稿を見つけたら `pcsleep` へ `"sleep"` を publish する。
 - 読み取り専用スコープ（`channels:history`）のみ。Beebotte 経由なので、ここでも「できるのは PC を寝かせることだけ」という設計が保たれる。
+- 認証情報（Slack/Beebotte トークン等）は本体から分離し、gitignore 済みの `slack_sleep_config.php` に置く（テンプレートは `slack_sleep_config.example.php`）。`.php` なので Apache 上では実行されソース＝トークンは配信されない。
 
 ---
 
@@ -197,7 +198,7 @@ Beebotte から `{"data": "status"}` を送って応答が返れば完了。
 | ダッシュボード | `dashboard.html` を VPS に配置（Basic 認証推奨）。Beebotte に `power`・`autopilot` リソースを作成 |
 | PC スリープ | `pcsleep_agent.py` を PC に常駐（タスクスケジューラ・`pythonw`）。`BEEBOTTE_TOKEN` を環境変数に |
 | 自動 Wake | `raspiwol-wake.{service,timer}` を `/etc/systemd/system/` に置き timer を enable（overlayfs なら base 層へ永続化） |
-| Slack スリープ | `slack_sleep_poll.php` を VPS に配置し cron 登録。Slack の User Token（`channels:history`）が必要 |
+| Slack スリープ | `slack_sleep_poll.php` ＋ `slack_sleep_config.php`（example をコピーして記入）を VPS に配置し cron 登録。Slack の User Token（`channels:history`）が必要 |
 
 ---
 
