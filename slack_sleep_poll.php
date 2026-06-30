@@ -9,18 +9,17 @@
  * cron で1分ごとに実行（VPS）:
  *   * * * * * /usr/bin/php /var/www/.../slack_sleep_poll.php >/dev/null 2>&1
  *
- * 定数は VPS 上のコピーで埋める。★本物のシークレットをリポジトリに commit しないこと。
+ * 認証情報・サイト固有設定は別ファイル slack_sleep_config.php に分離する（同じ
+ * ディレクトリに置く）。その実体はリポジトリに commit しない（.gitignore 済み）。
+ * テンプレートは slack_sleep_config.example.php をコピーして使う。
  * STATE_FILE は cron 実行ユーザーが書き込めるパスにする。
  *
  * 注意: autopilot スイッチとは独立（明示的な退勤操作なので OFF でも常に寝かせる＝案A）。
  */
 
-const SLACK_USER_TOKEN = "xoxp-FILL_ME";  // User OAuth Token（User Token Scope: channels:history）
-const BEEBOTTE_TOKEN   = "token_FILL_ME"; // Beebotte チャンネルトークン
-const TARGET_CHANNEL   = "C0FILL_ME";     // 勤怠チャンネルの ID（非公開なら groups:history が必要）
-const TARGET_USER      = "U0FILL_ME";     // 自分の Slack member ID
-const TRIGGER          = "終了";           // 本文に含まれていれば発火（部分一致）
-const STATE_FILE       = "/var/lib/raspiwol/slack_last_ts";  // 最後に見た ts（要・書込み権限）
+// 認証情報・サイト固有設定を読み込む（SLACK_USER_TOKEN / BEEBOTTE_TOKEN /
+// TARGET_CHANNEL / TARGET_USER / TRIGGER / STATE_FILE）。無ければ fatal で気づける。
+require __DIR__ . "/slack_sleep_config.php";
 
 const HIST_URL = "https://slack.com/api/conversations.history";
 const PUB_URL  = "https://api.beebotte.com/v1/data/publish/raspi3b/pcsleep";
@@ -77,6 +76,11 @@ if ($hit) {
         CURLOPT_POSTFIELDS => json_encode(array("data" => "sleep")),
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_TIMEOUT => 5,
+        // api.beebotte.com への TLS 検証が失敗する（HTTP 0／chain 検証不可。Slack 等の
+        // 他ホストは通るのにここだけ失敗＝Pi の bbt_write と同じ事象）。"sleep" を投げる
+        // だけの内部用途なので curl -k 相当で回避。正攻法は中間証明書/CAバンドルの整備。
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => 0,
     ));
     curl_exec($ch);
     curl_close($ch);

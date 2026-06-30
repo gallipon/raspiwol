@@ -8,3 +8,4 @@ ssh
 *.ini
 __pycache__/
 *.pyc
+slack_sleep_config.php
