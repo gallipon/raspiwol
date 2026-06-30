@@ -128,7 +128,7 @@ function publish(cmd, res) {
 }
 
 function readPower() {
-  return fetch(API + "/read/" + CHANNEL + "/" + POWER_RES + "?limit=1&_=" + Date.now(), {
+  return fetch(API + "/read/" + CHANNEL + "/" + POWER_RES + "?limit=1", {
     headers: { "X-Auth-Token": TOKEN }, cache: "no-store"
   }).then(function (r) {
     if (r.status === 404) {
@@ -184,7 +184,8 @@ sleepB.addEventListener("click", function () {
 // 表示の安定化: Beebotte は write→read の伝播にラグがあり、read が一時的に古い値を
 // 返すことがある。直近のローカル操作を localStorage に記録し、サーバ read が追いつく
 // まで（最大 LOCAL_TTL）はローカル値を優先表示する（リロードでも戻らない）。read 自体も
-// cache:"no-store"＋キャッシュバスターでブラウザのGETキャッシュを排除。
+// cache:"no-store" でブラウザのGETキャッシュを排除（URL は変えない＝Beebotte が未知の
+// クエリを 400 で弾くため、キャッシュバスター param は使わない）。
 var autoOn = true;
 var LOCAL_TTL = 60000;   // ローカル優先の有効期間(ms)
 function setAuto(on) {
@@ -201,7 +202,7 @@ function saveLocal(on) {
   catch (e) {}
 }
 function readAuto() {
-  return fetch(API + "/read/" + CHANNEL + "/" + AUTO_RES + "?limit=1&_=" + Date.now(), {
+  return fetch(API + "/read/" + CHANNEL + "/" + AUTO_RES + "?limit=1", {
     headers: { "X-Auth-Token": TOKEN }, cache: "no-store"
   }).then(function (r) {
     if (r.status === 404) { setAuto(true); return null; }   // 未設定は ON 既定
