@@ -47,9 +47,11 @@ PWR_GPIO   = cfg.getint("gpio", "pwr_pin", fallback=17)
 PWR_SHORT  = cfg.getfloat("gpio", "short_sec", fallback=0.1)
 
 # Beebotte REST API（ダッシュボードが read するステータスの永続化に使用）
-API_BASE       = "https://api.beebotte.com/v1/data"
-CHANNEL        = TOPIC_CMD.split("/")[0] if "/" in TOPIC_CMD else ""
-POWER_RESOURCE = "power"   # ※Beebotte チャンネルに事前に作成しておくこと
+API_BASE           = "https://api.beebotte.com/v1/data"
+CHANNEL            = TOPIC_CMD.split("/")[0] if "/" in TOPIC_CMD else ""
+POWER_RESOURCE     = "power"       # ※Beebotte チャンネルに事前に作成しておくこと
+AUTOPILOT_RESOURCE = "autopilot"   # ※同上。自動Wake/Sleep のマスタ ON/OFF スイッチ
+WAKE_TARGET = cfg.get("wake", "target", fallback="desktopmuk")  # 朝Wake の対象デバイス
 
 # name (lowercase) → mac
 devices: dict[str, str] = {}
@@ -276,6 +278,81 @@ def bbt_write(resource: str, value: str):
         print(f"bbt_write error: {e}", file=sys.stderr)
 
 
+def bbt_read(resource: str, default: str = "") -> str:
+    """Beebotte REST API で最新値を1件読む（取得失敗時は default を返す）。"""
+    if not CHANNEL or not MQTT_TOKEN:
+        return default
+    try:
+        req = urllib.request.Request(f"{API_BASE}/read/{CHANNEL}/{resource}?limit=1")
+        req.add_header("X-Auth-Token", MQTT_TOKEN)
+        with urllib.request.urlopen(req, timeout=5, context=_SSL_NOVERIFY) as r:
+            arr = json.loads(r.read())
+        if arr:
+            return str(arr[0].get("data", default))
+    except Exception as e:
+        print(f"bbt_read error: {e}", file=sys.stderr)
+    return default
+
+
+# ── 平日朝の自動 Wake（systemd timer から `raspiwol.py wake` で呼ばれる）─────────
+
+# 内閣府の祝日 CSV（公式・国民の振替休日も含む）。pip 依存を避けるため urllib で取得。
+HOLIDAY_CSV_URL = "https://www8.cao.go.jp/chosei/shukujitsu/syukujitsu.csv"
+
+
+def _jp_holidays() -> set:
+    """内閣府 CSV から祝日（＋日曜振替休日）の日付集合を返す。取得失敗時は空集合。"""
+    import datetime
+    hols: set = set()
+    try:
+        req = urllib.request.Request(HOLIDAY_CSV_URL)
+        with urllib.request.urlopen(req, timeout=8, context=_SSL_NOVERIFY) as r:
+            text = r.read().decode("cp932", errors="replace")   # CSV は Shift_JIS
+        for line in text.splitlines():
+            parts = line.split(",")[0].strip().split("/")        # 先頭列 "YYYY/M/D"
+            if len(parts) == 3 and all(p.isdigit() for p in parts):
+                y, m, day = map(int, parts)
+                hols.add(datetime.date(y, m, day))
+    except Exception as e:
+        print(f"_jp_holidays fetch error: {e}", file=sys.stderr)
+    return hols
+
+
+def is_workday(d=None) -> bool:
+    """出勤日なら True。平日(月〜金)かつ祝日でない。会社固有ルール「土曜に祝日が
+    被ると翌月曜が振替休」も考慮する。年末年始は対象外（autopilot OFF 運用で対応）。
+    祝日 CSV の取得に失敗した時は平日を出勤扱い（起こしすぎても寝かせ手段がある安全側）。"""
+    import datetime
+    if d is None:
+        d = datetime.date.today()
+    if d.weekday() >= 5:                       # 土日
+        return False
+    hols = _jp_holidays()
+    if not hols:                               # 取得失敗 → 祝日判定できないので平日は出勤扱い
+        return True
+    if d in hols:                              # 祝日＋日曜振替（CSV に含まれる）
+        return False
+    if d.weekday() == 0 and (d - datetime.timedelta(days=2)) in hols:
+        return False                           # ★会社ルール: 土曜の祝日→翌月曜休み
+    return True
+
+
+def run_scheduled_wake():
+    """出勤日 かつ autopilot ON のときだけ WAKE_TARGET へ WOL を送る。"""
+    if not is_workday():
+        print("scheduled_wake: 非出勤日のためスキップ")
+        return
+    if bbt_read(AUTOPILOT_RESOURCE, default="on").strip().lower() == "off":
+        print("scheduled_wake: autopilot OFF のためスキップ")
+        return
+    mac = devices.get(WAKE_TARGET)
+    if not mac:
+        print(f"scheduled_wake: 対象 '{WAKE_TARGET}' が devices に無い", file=sys.stderr)
+        return
+    ok = send_wol(mac)
+    print(f"scheduled_wake: WOL {WAKE_TARGET} ({mac}) {'ok' if ok else 'fail'}")
+
+
 def handle(data: str):
     cmd = data.strip().lower()
 
@@ -406,6 +483,10 @@ def _setup_signal_handler():
 
 
 def main():
+    # systemd timer から `raspiwol.py wake` で呼ばれる平日朝の自動 Wake（単発実行）。
+    if len(sys.argv) > 1 and sys.argv[1] == "wake":
+        run_scheduled_wake()
+        return
     _setup_signal_handler()
     print(f"raspiwol start | devices={list(devices.keys())} | ip={local_ip()}")
     while True:

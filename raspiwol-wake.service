@@ -1,0 +1,14 @@
+[Unit]
+Description=raspiwol scheduled weekday morning Wake-on-LAN
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+# 単発実行: 出勤日判定(jpholiday+会社ルール)＋autopilot ON なら対象PCへ WOL。
+# /boot/firmware の本体を直接実行（update で更新された版がそのまま使われる）。
+Type=oneshot
+ExecStart=/usr/bin/python3 /boot/firmware/raspiwol.py wake
+User=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=raspiwol-wake
