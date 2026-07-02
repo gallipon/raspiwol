@@ -52,7 +52,11 @@ AUTO_TOPIC    = CHANNEL + "/" + AUTO_RESOURCE
 
 # Auto-sleep policy (constants -- tweak freely).
 CUTOFF_HOUR = 19    # only auto-sleep at/after this hour (work end = 19:00)
-IDLE_MIN    = 30    # required minutes with no keyboard/mouse input
+IDLE_MIN    = 60    # required minutes with no keyboard/mouse input
+                    # NOTE: GetLastInputInfo tracks physical keyboard/mouse only.
+                    # Long background jobs (builds, Claude Code runs, downloads)
+                    # do NOT count as activity -- an unattended long run can be
+                    # suspended once past IDLE_MIN. Slack "終了" is the main path.
 CHECK_SEC   = 60    # how often the auto-sleep loop evaluates
 COOLDOWN_SEC = 300  # grace after an auto-sleep/resume before considering again
 
