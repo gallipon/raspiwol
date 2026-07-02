@@ -115,7 +115,7 @@ Pi を eth0（会社有線）と wlan0（ゲスト WiFi）の**両方に接続**
   - **祝日判定は内閣府の祝日 CSV**（公式・国民の振替休日込み）を取得して行う＝**外部ライブラリ依存なし**。
   - **会社固有ルール**：土曜に祝日が被ると翌月曜が振替休（祝日法には無いので独自に計算）。
   - 年末年始など不定期の休みは autopilot を OFF にして対応（＝休暇・出張時も一括停止できる）。
-- **idle Sleep（PC）**：`pcsleep_agent.py` が 平日・終業時刻(19:00)以降・無操作30分（`GetLastInputInfo`）で自動スリープ。autopilot ON のときだけ。
+- **idle Sleep（PC）**：`pcsleep_agent.py` が 平日・終業時刻(19:00)以降・無操作60分（`GetLastInputInfo`）で自動スリープ。autopilot ON のときだけ。取りこぼしは Slack「終了」が拾う。
 - **手動/Slack の Sleep は autopilot に関係なく常に有効**（明示的な操作は尊重する）。
 
 ---
