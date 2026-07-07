@@ -353,6 +353,72 @@ def run_scheduled_wake():
     print(f"scheduled_wake: WOL {WAKE_TARGET} ({mac}) {'ok' if ok else 'fail'}")
 
 
+# ── 深夜 nightwatch（systemd timer から `raspiwol.py nightwatch` で呼ばれる）────────
+
+# 通知済みフラグ（RAM 上 /tmp。overlayfs に書かない。再起動で消えるため mtime で有効期限判定）。
+_NIGHTWATCH_FLAG = Path("/tmp/raspiwol_nightwatch.flag")
+
+
+def run_nightwatch():
+    """深夜に対象 PC が起動中なら ntfy.sh でスマホへ通知する（自動スリープはしない）。"""
+    import datetime
+
+    # 1. ini の [nightwatch] から設定を読む。どちらか未設定なら無効
+    ntfy_topic = cfg.get("nightwatch", "ntfy_topic", fallback="").strip()
+    target_ip  = cfg.get("nightwatch", "target_ip",  fallback="").strip()
+    if not ntfy_topic or not target_ip:
+        print("nightwatch: not configured")
+        return
+
+    # 2. autopilot チェック。"off" なら skip。read 失敗時は default "on"（=続行）。
+    #    Beebotte が死んでいる時こそ pcsleep_agent も止まっている可能性があるため。
+    if bbt_read(AUTOPILOT_RESOURCE, default="on").strip().lower() == "off":
+        print("nightwatch: autopilot=off, skip")
+        return
+
+    # 3. ping で PC 状態確認（-c2 -W2：1発ロス耐性。ping_host は -c1 のため直接呼ばない）
+    try:
+        r = subprocess.run(
+            ["ping", "-c", "2", "-W", "2", target_ip],
+            capture_output=True,
+        )
+        pc_up = r.returncode == 0
+    except Exception:
+        pc_up = False
+
+    if not pc_up:
+        print("nightwatch: pc=down, ok")
+        return
+
+    # 4. 通知済みフラグ確認（12時間以内に通知済みなら一晩1回だけ）
+    if _NIGHTWATCH_FLAG.exists():
+        age_sec = time.time() - _NIGHTWATCH_FLAG.stat().st_mtime
+        if age_sec < 12 * 3600:
+            print("nightwatch: already notified")
+            return
+
+    # 5. ntfy.sh へ通知（証明書検証は通常どおり有効。CERT_NONE は Beebotte 専用の回避策）
+    now_str = datetime.datetime.now().strftime("%H:%M")
+    body = f"⚠️ PC がまだ起きています ({now_str}) — pcsleep_agent の死亡かも".encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{ntfy_topic}",
+            data=body,
+            method="POST",
+        )
+        req.add_header("Title", "raspiwol nightwatch")   # ASCII のみ
+        req.add_header("Tags", "warning")
+        req.add_header("Priority", "high")
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"nightwatch: ntfy error: {e}", file=sys.stderr)
+        return
+
+    # 6. フラグを touch して "一晩1回" を保証
+    _NIGHTWATCH_FLAG.touch()
+    print("nightwatch: pc=up, notified")
+
+
 def handle(data: str):
     cmd = data.strip().lower()
 
@@ -486,6 +552,10 @@ def main():
     # systemd timer から `raspiwol.py wake` で呼ばれる平日朝の自動 Wake（単発実行）。
     if len(sys.argv) > 1 and sys.argv[1] == "wake":
         run_scheduled_wake()
+        return
+    # systemd timer から `raspiwol.py nightwatch` で呼ばれる深夜監視（単発実行）。
+    if len(sys.argv) > 1 and sys.argv[1] == "nightwatch":
+        run_nightwatch()
         return
     _setup_signal_handler()
     print(f"raspiwol start | devices={list(devices.keys())} | ip={local_ip()}")
