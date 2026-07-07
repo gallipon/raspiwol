@@ -21,3 +21,10 @@ pwr_pin = 17
 ; 平日朝の自動 Wake（raspiwol-wake.timer → `raspiwol.py wake`）の対象デバイス名
 ; （raspiwol_devices.csv の名前。未指定なら officepc）
 target = officepc
+
+[nightwatch]
+; 深夜に PC が起きていたら ntfy.sh へ通知（どちらか空なら無効）
+; ntfy.sh のトピック名（https://ntfy.sh/<topic> の <topic> 部分）
+ntfy_topic =
+; 監視対象 PC の IP アドレス
+target_ip = 192.168.1.50

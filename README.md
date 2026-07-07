@@ -116,6 +116,7 @@ Pi を eth0（会社有線）と wlan0（ゲスト WiFi）の**両方に接続**
   - **会社固有ルール**：土曜に祝日が被ると翌月曜が振替休（祝日法には無いので独自に計算）。
   - 年末年始など不定期の休みは autopilot を OFF にして対応（＝休暇・出張時も一括停止できる）。
 - **idle Sleep（PC）**：`pcsleep_agent.py` が 平日・終業時刻(19:00)以降・無操作60分（`GetLastInputInfo`）で自動スリープ。autopilot ON のときだけ。取りこぼしは Slack「終了」が拾う。
+- **nightwatch（Pi）**：systemd timer（22:00〜翌06:00 の毎時）→ `raspiwol.py nightwatch`。autopilot ON かつ PC が ping 応答するなら ntfy.sh でスマホへ通知する。**自動スリープはしない**——深夜に意図せずスリープするより「気づいて判断させる」を優先した設計。一晩1回（フラグ /tmp に保持）。
 - **手動/Slack の Sleep は autopilot に関係なく常に有効**（明示的な操作は尊重する）。
 
 ---

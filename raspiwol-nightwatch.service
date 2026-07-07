@@ -1,0 +1,15 @@
+[Unit]
+Description=raspiwol nightwatch: PC が深夜に起動中なら ntfy.sh へ通知
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+# 単発実行: autopilot ON かつ対象 PC が応答したら ntfy.sh でスマホに通知。
+# pcsleep_agent が死んで PC が寝られない状態を夜間に検知する（自動スリープはしない）。
+# /boot/firmware の本体を直接実行（update で更新された版がそのまま使われる）。
+Type=oneshot
+ExecStart=/usr/bin/python3 /boot/firmware/raspiwol.py nightwatch
+User=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=raspiwol-nightwatch
