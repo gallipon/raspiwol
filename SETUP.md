@@ -58,6 +58,7 @@ Beebotte から `{"data": "status"}` を送って応答が返れば完了。
 | ダッシュボード | `dashboard.html` を VPS に配置（Basic 認証推奨）。Beebotte に `power`・`autopilot` リソースを作成 |
 | PC スリープ | `pcsleep_agent.py` を PC に常駐（タスクスケジューラ・`pythonw`）。`BEEBOTTE_TOKEN` を環境変数に |
 | 自動 Wake | `raspiwol-wake.{service,timer}` を `/etc/systemd/system/` に置き timer を enable（overlayfs なら base 層へ永続化） |
+| nightwatch | `raspiwol-nightwatch.{service,timer}` を同様に配置・enable。`raspiwol.ini` の `[nightwatch]` に `ntfy_topic`（ntfy.sh トピック名）と `target_ip` を記入。スマホに ntfy アプリを入れてトピックを購読する |
 | Slack スリープ | `slack_sleep_poll.php` ＋ `slack_sleep_config.php`（example をコピーして記入）を VPS に配置し cron 登録。Slack の User Token（`channels:history`）が必要 |
 
 ---

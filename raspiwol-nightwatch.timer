@@ -1,0 +1,13 @@
+[Unit]
+Description=Trigger raspiwol nightwatch hourly during 22:00–06:00
+
+[Timer]
+# 深夜帯（22:00〜翌06:00）の毎時00分に実行。
+# pcsleep_agent が停止して PC が寝られない状態を夜間に検知するためのウィンドウ。
+OnCalendar=*-*-* 22,23:00:00
+OnCalendar=*-*-* 00..06:00:00
+# Pi が起動していなかった時間帯の取りこぼしを後から実行しない（深夜帯以外に実行しない）
+Persistent=false
+
+[Install]
+WantedBy=timers.target
