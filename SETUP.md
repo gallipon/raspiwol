@@ -64,30 +64,37 @@ Beebotte から `{"data": "status"}` を送って応答が返れば完了。
 
 **Beebotte `agent` リソースの作成**：Beebotte コンソール → チャンネル `raspi3b` → リソース追加 → 名前 `agent`（`power`・`autopilot` と同手順）。未作成の場合 dashboard の Agent 表示は「⚫ 不明」になり GPIO ボタンは表示されない。
 
-**ウォッチドッグタスクの作成例（PowerShell・管理者権限で実行）**：
+**ウォッチドッグの作成例（PowerShell）**：
 
-ポイントは**「pcsleep_agent プロセスが不在のときだけ再起動する」ガード付きアクション**にすること。
-起動自体は既存の `pcsleep_agent` タスク（対話セッション／ログオン時トリガー）を `Start-ScheduledTask` で
-呼び直す＝起動方法の単一ソースを保つ。単純に pythonw を毎回起動する定義にすると 5分ごとに多重起動し、
-同一 client_id で MQTT 上互いを蹴り合うので不可。
+要点は3つ。①**プロセス不在のときだけ**既存の `pcsleep_agent` タスクを `Start-ScheduledTask` で起動する
+ガード（単純に pythonw を毎回起動すると 5分ごとに多重起動し、同一 client_id で MQTT 上互いを蹴り合う）。
+②ガードは**インラインに埋め込まず `.ps1` ファイルに出して `-File` で実行**する（インラインの `-Command` は
+クオート崩れで壊れやすい）。③タスクは **S4U（バックグラウンド）principal** にする——`Interactive` にすると
+5分ごとに powershell のコンソール窓が一瞬チラつくため。S4U なら窓は出ず、`Start-ScheduledTask` で対話
+セッションの `pcsleep_agent` を起動する動作は問題なく効く（検証済み）。
+
+まずガードスクリプトを作成（パスは自分の環境に合わせる）:
 
 ```powershell
-# プロセス不在なら既存の pcsleep_agent タスクを起動する（ガード付き）
-$guard = "if (-not (Get-CimInstance Win32_Process -Filter ""Name LIKE 'python%'"" | " +
-         "Where-Object { $_.CommandLine -like '*pcsleep_agent*' })) { " +
-         "Start-ScheduledTask -TaskName pcsleep_agent }"
+# C:\path\to\pcsleep_watchdog.ps1
+$running = Get-CimInstance Win32_Process -Filter "Name LIKE 'python%'" |
+           Where-Object { $_.CommandLine -like '*pcsleep_agent*' }
+if (-not $running) { Start-ScheduledTask -TaskName pcsleep_agent }
+```
 
+タスクを登録:
+
+```powershell
+$ps1 = "C:\path\to\pcsleep_watchdog.ps1"
 $action  = New-ScheduledTaskAction -Execute "powershell.exe" `
-               -Argument ("-NoProfile -WindowStyle Hidden -Command """ + $guard + """")
+               -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ps1`""
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
                -RepetitionInterval (New-TimeSpan -Minutes 5)
-$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
-
-$definition = New-ScheduledTask -Action $action -Trigger $trigger `
-                  -Settings $settings -Principal $principal `
-                  -Description "pcsleep_agent watchdog: start it if the process is absent"
-Register-ScheduledTask -TaskName "pcsleep_agent_watchdog" -InputObject $definition
+$settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -Hidden
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Limited
+$def = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings `
+           -Principal $principal -Description "pcsleep_agent watchdog: start agent if absent"
+Register-ScheduledTask -TaskName "pcsleep_agent_watchdog" -InputObject $def -Force
 ```
 
 > `os._exit(1)` でプロセスが消えると、次回 5分スキャンでガードが不在を検知して `pcsleep_agent` タスクを
