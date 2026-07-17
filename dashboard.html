@@ -39,6 +39,17 @@
   .autobtn { padding: 10px 18px; min-width: 88px; border-radius: 14px; font-size: 15px; font-weight: 700; }
   .autobtn.on  { background: #34a853; }
   .autobtn.off { background: #5f6368; }
+  .agent-row { font-size: 12px; color: #80868b; text-align: center; }
+  .gpio-section { display: none; flex-direction: column; align-items: center; gap: 8px; }
+  .gpio-section.visible { display: flex; }
+  .gpio-warn { font-size: 11px; color: #ea4335; text-align: center; max-width: 300px; line-height: 1.5; }
+  .gpio-btn {
+    background: #b71c1c; padding: 14px 22px; min-width: 200px;
+    border-radius: 14px; font-size: 14px; font-weight: 700; color: #fff;
+    border: none; cursor: pointer; transition: transform .05s, opacity .2s;
+  }
+  .gpio-btn:active { transform: scale(.96); }
+  .gpio-btn:disabled { opacity: .4; cursor: default; }
   #log {
     width: 100%; max-width: 380px; height: 96px; overflow-y: auto;
     background: #0e1014; border-radius: 10px; padding: 10px 12px;
@@ -70,6 +81,18 @@
     target <span id="ip"></span>
   </div>
 
+  <div class="agent-row">
+    PC エージェント: <span id="agent-status">確認中…</span>
+  </div>
+
+  <div id="gpio-section" class="gpio-section">
+    <div class="gpio-warn">
+      ⚠️ エージェントが応答していません。GPIO 電源ボタンでのスリープは<br>
+      約 60% の成功率で、寝ても起き返すことがあります。
+    </div>
+    <button id="gpio-btn" class="gpio-btn">GPIO で寝かせる（最終手段・不確実）</button>
+  </div>
+
   <div id="log"></div>
 
 <script>
@@ -83,6 +106,8 @@ var SLEEP_RES = "pcsleep";      // PC スリープ指示先（raspi3b/pcsleep）
 var AUTO_RES  = "autopilot";    // 自動Wake/Sleep のマスタースイッチ（raspi3b/autopilot）※Beebotteに作成要
 var WAKE_CMD  = "officepc";   // WOL マジックパケット送信（raspi3b/wol へ）
 var SLEEP_CMD = "sleep";        // PC エージェントが解釈するスリープ指示（SetSuspendState）
+var AGENT_RES      = "agent";   // PC エージェントのハートビートリソース（raspi3b/agent）※Beebotteに作成要
+var AGENT_STALE_MS = 150000;    // この秒数（150秒）を超えて未更新なら agent down 判定
 var POLL_MS   = 12000;          // ステータス更新間隔
 var REPLY_MS  = 2000;           // ping 送信→Pi の write 完了を待つ猶予
 
@@ -90,12 +115,15 @@ var REPLY_MS  = 2000;           // ping 送信→Pi の write 完了を待つ猶
 var TOKEN = decodeURIComponent((location.hash || "").replace(/^#/, "").trim());
 
 // ── DOM ────────────────────────────────────────────────────────────────────
-var dot   = document.getElementById("dot");
-var label = document.getElementById("label");
-var conn  = document.getElementById("conn");
-var wakeB = document.getElementById("wake");
-var sleepB= document.getElementById("sleep");
-var autoB = document.getElementById("auto");
+var dot         = document.getElementById("dot");
+var label       = document.getElementById("label");
+var conn        = document.getElementById("conn");
+var wakeB       = document.getElementById("wake");
+var sleepB      = document.getElementById("sleep");
+var autoB       = document.getElementById("auto");
+var agentStatus = document.getElementById("agent-status");
+var gpioSection = document.getElementById("gpio-section");
+var gpioBtn     = document.getElementById("gpio-btn");
 document.getElementById("ip").textContent = TARGET_IP;
 
 function logLine(s) {
@@ -108,7 +136,7 @@ function setStatus(state, text) { dot.className = "dot " + state; label.textCont
 if (!TOKEN) {
   setStatus("down", "トークン未設定");
   conn.textContent = "URL の末尾に #token_XXXX を付けて開いてください";
-  wakeB.disabled = sleepB.disabled = autoB.disabled = true;
+  wakeB.disabled = sleepB.disabled = autoB.disabled = gpioBtn.disabled = true;
   throw new Error("no token");
 }
 
@@ -140,6 +168,49 @@ function readPower() {
   });
 }
 
+// ── Agent 生存確認 ─────────────────────────────────────────────────────────
+// エージェントが AGENT_TOPIC へ定期 publish する epoch 秒（data フィールド）を read し、
+// 現在時刻との差が AGENT_STALE_MS を超えていれば down 判定して GPIO ボタンを表示する。
+// 404（リソース未作成）は「不明」扱いにして GPIO ボタンは出さない（誤爆防止）。
+function readAgent() {
+  return fetch(API + "/read/" + CHANNEL + "/" + AGENT_RES + "?limit=1", {
+    headers: { "X-Auth-Token": TOKEN }, cache: "no-store"
+  }).then(function (r) {
+    if (r.status === 404) {
+      agentStatus.textContent = "⚫ 不明（agent リソース未作成）";
+      gpioSection.classList.remove("visible");
+      return null;
+    }
+    return r.json();
+  }).then(function (arr) {
+    if (!arr) return;
+    if (!Array.isArray(arr) || !arr[0]) {
+      agentStatus.textContent = "⚫ 不明";
+      gpioSection.classList.remove("visible");
+      return;
+    }
+    // data フィールドはエージェントが入れた epoch 秒（Beebotte の ts はミリ秒なので使わない）
+    var agentEpochSec = Number(arr[0].data);
+    if (!agentEpochSec) {
+      agentStatus.textContent = "⚫ 不明";
+      gpioSection.classList.remove("visible");
+      return;
+    }
+    var staleMs = Date.now() - agentEpochSec * 1000;
+    if (staleMs < AGENT_STALE_MS) {
+      agentStatus.textContent = "🟢 alive（" + Math.round(staleMs / 1000) + "秒前）";
+      gpioSection.classList.remove("visible");
+    } else {
+      agentStatus.textContent = "⚫ down（" + Math.round(staleMs / 1000) + "秒前が最後）";
+      gpioSection.classList.add("visible");
+    }
+  }).catch(function (e) {
+    agentStatus.textContent = "⚫ 不明";
+    gpioSection.classList.remove("visible");
+    logLine("agent read エラー: " + e.message);
+  });
+}
+
 // ── ステータス更新 ──────────────────────────────────────────────────────────
 // 前面タブ かつ ウィンドウにフォーカスがある時だけ叩く（別アプリ作業中・別タブ・最小化では止める）
 function active() { return !document.hidden && document.hasFocus(); }
@@ -158,10 +229,13 @@ function refresh() {
   setTimeout(function () {
     readPower().then(renderPower).catch(function (e) { logLine("read エラー: " + e.message); });
   }, REPLY_MS);
+  // Agent 生存確認: power ポーリングに相乗り（same cadence, no extra timer）
+  readAgent();
 }
 
 // 初回は ping を待たず直近の power を即 read して last-known を表示（体感速度の改善）。
 readPower().then(renderPower).catch(function () {});
+readAgent();   // 初回もエージェント状態を即表示
 refresh();
 setInterval(refresh, POLL_MS);
 document.addEventListener("visibilitychange", function () { if (active()) refresh(); });
@@ -179,6 +253,17 @@ sleepB.addEventListener("click", function () {
   publish(SLEEP_CMD, SLEEP_RES);   // pcsleep リソースへ "sleep" → PC エージェントが実行
   setStatus("wait", "スリープ中…");
   setTimeout(refresh, 6000);
+});
+
+// ── GPIO 最終手段ボタン ──────────────────────────────────────────────────────
+// エージェントが down のときだけ表示（readAgent が制御）。
+// raspi3b/wol へ "pwrbtn" を publish → raspiwol.py が GPIO 短押し（電源ボタン）を実行。
+// 成功率 ~60%・寝ても起き返す可能性があるため、手動明示のみで自動発火しない。
+gpioBtn.addEventListener("click", function () {
+  if (!confirm("Agent が応答していません。GPIO 電源ボタンでのスリープは約 60% の成功率で、"
+      + "寝ても起き返すことがあります。実行しますか？")) return;
+  publish("pwrbtn");   // CMD_RES(wol) へ publish → Pi の raspiwol.py が GPIO 短押し
+  logLine("GPIO 電源ボタン送信（最終手段）");
 });
 
 // ── 自動 Wake/Sleep スイッチ（autopilot）──────────────────────────────────────

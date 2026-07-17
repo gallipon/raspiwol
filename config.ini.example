@@ -28,3 +28,7 @@ target = officepc
 ntfy_topic =
 ; 監視対象 PC の IP アドレス
 target_ip = 192.168.1.50
+
+; PC 常駐エージェント（pcsleep_agent.py）のハートビート/生存可視化用リソース "agent" は
+; Beebotte コンソールでチャンネルに作成しておくこと（power・autopilot と同様）。
+; 未作成の場合 dashboard の Agent 生存表示は「⚫ 不明」になり GPIO ボタンは表示されない。
