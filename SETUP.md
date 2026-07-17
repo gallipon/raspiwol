@@ -66,26 +66,32 @@ Beebotte から `{"data": "status"}` を送って応答が返れば完了。
 
 **ウォッチドッグタスクの作成例（PowerShell・管理者権限で実行）**：
 
-```powershell
-# pcsleep_agent.py の実際のパスを変数に設定する
-$pyPath    = "C:\Users\<ユーザー名>\AppData\Local\Programs\Python\Python3\pythonw.exe"
-$scriptPath = "C:\path\to\raspiwol\pcsleep_agent.py"
+ポイントは**「pcsleep_agent プロセスが不在のときだけ再起動する」ガード付きアクション**にすること。
+起動自体は既存の `pcsleep_agent` タスク（対話セッション／ログオン時トリガー）を `Start-ScheduledTask` で
+呼び直す＝起動方法の単一ソースを保つ。単純に pythonw を毎回起動する定義にすると 5分ごとに多重起動し、
+同一 client_id で MQTT 上互いを蹴り合うので不可。
 
-$action  = New-ScheduledTaskAction -Execute $pyPath -Argument $scriptPath
-$trigger = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Minutes 5) `
-               -Once -At (Get-Date)
-$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
-               -ExecutionTimeLimit (New-TimeSpan -Hours 0)
+```powershell
+# プロセス不在なら既存の pcsleep_agent タスクを起動する（ガード付き）
+$guard = "if (-not (Get-CimInstance Win32_Process -Filter ""Name LIKE 'python%'"" | " +
+         "Where-Object { $_.CommandLine -like '*pcsleep_agent*' })) { " +
+         "Start-ScheduledTask -TaskName pcsleep_agent }"
+
+$action  = New-ScheduledTaskAction -Execute "powershell.exe" `
+               -Argument ("-NoProfile -WindowStyle Hidden -Command """ + $guard + """")
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+               -RepetitionInterval (New-TimeSpan -Minutes 5)
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
 
-# タスク定義：プロセスが既に動いていれば何もしない（IgnoreNew）
 $definition = New-ScheduledTask -Action $action -Trigger $trigger `
                   -Settings $settings -Principal $principal `
-                  -Description "pcsleep_agent watchdog: restart if not running"
+                  -Description "pcsleep_agent watchdog: start it if the process is absent"
 Register-ScheduledTask -TaskName "pcsleep_agent_watchdog" -InputObject $definition
 ```
 
-> ウォッチドッグは `IgnoreNew` 設定にするため、既存プロセスが生きている限り二重起動しない。`os._exit(1)` でプロセスが消えた後の次回 5分スキャンで再起動される。
+> `os._exit(1)` でプロセスが消えると、次回 5分スキャンでガードが不在を検知して `pcsleep_agent` タスクを
+> 起動し直す。プロセスが生きている間はガードが弾くので二重起動しない。
 
 ---
 
