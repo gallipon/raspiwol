@@ -55,11 +55,50 @@ Beebotte から `{"data": "status"}` を送って応答が返れば完了。
 
 | 機能 | 概要 |
 |---|---|
-| ダッシュボード | `dashboard.html` を VPS に配置（Basic 認証推奨）。Beebotte に `power`・`autopilot` リソースを作成 |
+| ダッシュボード | `dashboard.html` を VPS に配置（Basic 認証推奨）。Beebotte に `power`・`autopilot`・**`agent`** リソースを作成 |
 | PC スリープ | `pcsleep_agent.py` を PC に常駐（タスクスケジューラ・`pythonw`）。`BEEBOTTE_TOKEN` を環境変数に |
 | 自動 Wake | `raspiwol-wake.{service,timer}` を `/etc/systemd/system/` に置き timer を enable（overlayfs なら base 層へ永続化） |
 | nightwatch | `raspiwol-nightwatch.{service,timer}` を同様に配置・enable。`raspiwol.ini` の `[nightwatch]` に `ntfy_topic`（ntfy.sh トピック名）と `target_ip` を記入。スマホに ntfy アプリを入れてトピックを購読する |
 | Slack スリープ | `slack_sleep_poll.php` ＋ `slack_sleep_config.php`（example をコピーして記入）を VPS に配置し cron 登録。Slack の User Token（`channels:history`）が必要 |
+| **ゾンビ対策ウォッチドッグ** | `pcsleep_agent.py` がゾンビ検出時に `os._exit(1)` で終了するため、タスクスケジューラで 5分ごとに「プロセスが居なければ再起動」するウォッチドッグタスクを追加する（下記コマンド例参照） |
+
+**Beebotte `agent` リソースの作成**：Beebotte コンソール → チャンネル `raspi3b` → リソース追加 → 名前 `agent`（`power`・`autopilot` と同手順）。未作成の場合 dashboard の Agent 表示は「⚫ 不明」になり GPIO ボタンは表示されない。
+
+**ウォッチドッグの作成例（PowerShell）**：
+
+要点は3つ。①**プロセス不在のときだけ**既存の `pcsleep_agent` タスクを `Start-ScheduledTask` で起動する
+ガード（単純に pythonw を毎回起動すると 5分ごとに多重起動し、同一 client_id で MQTT 上互いを蹴り合う）。
+②ガードは**インラインに埋め込まず `.ps1` ファイルに出して `-File` で実行**する（インラインの `-Command` は
+クオート崩れで壊れやすい）。③タスクは **S4U（バックグラウンド）principal** にする——`Interactive` にすると
+5分ごとに powershell のコンソール窓が一瞬チラつくため。S4U なら窓は出ず、`Start-ScheduledTask` で対話
+セッションの `pcsleep_agent` を起動する動作は問題なく効く（検証済み）。
+
+まずガードスクリプトを作成（パスは自分の環境に合わせる）:
+
+```powershell
+# C:\path\to\pcsleep_watchdog.ps1
+$running = Get-CimInstance Win32_Process -Filter "Name LIKE 'python%'" |
+           Where-Object { $_.CommandLine -like '*pcsleep_agent*' }
+if (-not $running) { Start-ScheduledTask -TaskName pcsleep_agent }
+```
+
+タスクを登録:
+
+```powershell
+$ps1 = "C:\path\to\pcsleep_watchdog.ps1"
+$action  = New-ScheduledTaskAction -Execute "powershell.exe" `
+               -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ps1`""
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+               -RepetitionInterval (New-TimeSpan -Minutes 5)
+$settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -Hidden
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Limited
+$def = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings `
+           -Principal $principal -Description "pcsleep_agent watchdog: start agent if absent"
+Register-ScheduledTask -TaskName "pcsleep_agent_watchdog" -InputObject $def -Force
+```
+
+> `os._exit(1)` でプロセスが消えると、次回 5分スキャンでガードが不在を検知して `pcsleep_agent` タスクを
+> 起動し直す。プロセスが生きている間はガードが弾くので二重起動しない。
 
 ---
 
