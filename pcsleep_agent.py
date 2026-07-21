@@ -116,20 +116,33 @@ def idle_seconds():
 
 
 def read_autopilot():
-    """Read the current switch state once via Beebotte REST (default: on)."""
+    """Read the current switch state once via Beebotte REST.
+
+    api.beebotte.com serves an incomplete certificate chain, so Python's
+    OpenSSL rejects it (CERTIFICATE_VERIFY_FAILED) even though curl/browsers
+    pass via AIA fetching.  We disable verification here -- same workaround as
+    the Pi's bbt_write.  Without it this read always failed and fell back to
+    "on", which once caused an unexpected auto-sleep while the switch was off.
+
+    On failure we fail SAFE = off: a read error must never enable auto-sleep.
+    """
     global autopilot_on
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
     try:
         req = urllib.request.Request(
             "https://api.beebotte.com/v1/data/read/%s/%s?limit=1"
             % (CHANNEL, AUTO_RESOURCE))
         req.add_header("X-Auth-Token", TOKEN)
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
             arr = json.loads(r.read())
         if arr:
-            autopilot_on = str(arr[0].get("data", "on")).strip().lower() == "on"
+            autopilot_on = str(arr[0].get("data", "off")).strip().lower() == "on"
         print("autopilot initial state: " + ("on" if autopilot_on else "off"))
     except Exception as e:
-        print("autopilot read failed (default on): " + str(e), file=sys.stderr)
+        autopilot_on = False   # fail safe: never auto-sleep on a read failure
+        print("autopilot read failed (fail-safe off): " + str(e), file=sys.stderr)
 
 
 def autopilot_loop():
