@@ -20,7 +20,30 @@ Beebotte のコマンドトピック（`raspi3b/wol`）に `{"data": "<コマン
 | `"update"` | GitHub から最新コードを取得してサービス再起動 |
 | `"reboot"` / `"shutdown"` | Pi を再起動 / シャットダウン |
 
-スリープ系は別リソースに送る：Web/Slack は `pcsleep` へ `"sleep"`（PC エージェントが実行）、自動運転の ON/OFF は `autopilot` へ `"on"/"off"`。
+スリープ系は別リソースに送る：Web/Slack は `pcsleep` へ、自動運転の ON/OFF は `autopilot` へ `"on"/"off"`。
+
+`pcsleep` リソース（PC 常駐エージェント `pcsleep_agent.py` が購読・実行）：
+
+| data | 動作 |
+|---|---|
+| `"sleep"` | 即時スリープ（ダッシュボードの Sleep ／ Slack「終了」） |
+| `"sleep_in <分>"` | **遅延スリープ予約**：`<分>` 経過 **かつ** 直近 5 分無操作でスリープ。省略時 10 分 |
+| `"cancel"` | 予約を取消 |
+
+遅延スリープは Slack に「終了」を書かない**出社日の退勤用**。カウントダウン中に操作しても
+予約は消えず**延期**されるだけなので、席に戻って作業を続けても勝手に寝ず、離席すれば確実に寝る。
+予約は 4 時間（`DEFER_MAX_MIN`）経過すると未発火のまま破棄される（押し忘れが翌朝に効かないための安全弁）。
+`autopilot` スイッチには依存しない（明示操作のため）。
+
+送信手段は 2 つ：
+
+- ダッシュボードの **「退勤（10分後スリープ）」** ボタン（残り時間表示＋取消ボタン付き）
+- PC のシェルから **`bye`**（`bye 20` で分指定、`bye now` で即時、`bye cancel` で取消）
+  - `bye.cmd` は `pcsleep_cmd.py` のラッパー。PATH の通ったディレクトリ（会社 PC では
+    `%USERPROFILE%\.local\bin`＝既に user PATH 済み）に置き、`pcsleep_cmd.py` は
+    `%USERPROFILE%\` に置く。直接 `python pcsleep_cmd.py ...` でも同じ
+  - ⚠️ `.cmd` は **ASCII のみ**で書くこと。cmd.exe は OEM コードページで読むため、日本語コメント中の
+    0x5C バイトで行が壊れて `'ディレクトリ' は認識されていません` 系のエラーになる（実際に踏んだ）
 
 ---
 

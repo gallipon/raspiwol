@@ -34,6 +34,10 @@
   button:disabled { opacity: .4; cursor: default; }
   .wake  { background: #1a73e8; }
   .sleep { background: #5f6368; }
+  .leave { background: #7b5800; min-width: 280px; padding: 16px 22px; font-size: 16px; }
+  .deferrow { display: none; align-items: center; gap: 12px; font-size: 13px; color: #e8eaed; }
+  .deferrow.visible { display: flex; }
+  .cancelbtn { padding: 8px 14px; min-width: 0; border-radius: 12px; font-size: 13px; background: #5f6368; }
   .meta { font-size: 12px; color: #80868b; text-align: center; line-height: 1.6; }
   .autorow { display: flex; align-items: center; gap: 12px; font-size: 14px; color: #9aa0a6; }
   .autobtn { padding: 10px 18px; min-width: 88px; border-radius: 14px; font-size: 15px; font-weight: 700; }
@@ -71,6 +75,13 @@
     <button id="sleep" class="sleep">Sleep</button>
   </div>
 
+  <button id="leave" class="leave">退勤（10分後スリープ）</button>
+
+  <div id="defer-row" class="deferrow">
+    <span id="defer-text"></span>
+    <button id="defer-cancel" class="cancelbtn">取消</button>
+  </div>
+
   <div class="autorow">
     <span>自動 Wake/Sleep</span>
     <button id="auto" class="autobtn off">--</button>
@@ -106,6 +117,8 @@ var SLEEP_RES = "pcsleep";      // PC スリープ指示先（raspi3b/pcsleep）
 var AUTO_RES  = "autopilot";    // 自動Wake/Sleep のマスタースイッチ（raspi3b/autopilot）※Beebotteに作成要
 var WAKE_CMD  = "officepc";   // WOL マジックパケット送信（raspi3b/wol へ）
 var SLEEP_CMD = "sleep";        // PC エージェントが解釈するスリープ指示（SetSuspendState）
+var DEFER_MIN  = 10;            // 退勤ボタンの遅延（分）→ "sleep_in 10" を pcsleep へ
+var DEFER_IDLE_MIN = 5;         // 遅延経過後に必要なアイドル分数（エージェント側の定数と揃える・表示用）
 var AGENT_RES      = "agent";   // PC エージェントのハートビートリソース（raspi3b/agent）※Beebotteに作成要
 var AGENT_STALE_MS = 150000;    // この秒数（150秒）を超えて未更新なら agent down 判定
 var POLL_MS   = 12000;          // ステータス更新間隔
@@ -251,9 +264,53 @@ wakeB.addEventListener("click", function () {
 sleepB.addEventListener("click", function () {
   if (!confirm("officepc をスリープさせますか？")) return;
   publish(SLEEP_CMD, SLEEP_RES);   // pcsleep リソースへ "sleep" → PC エージェントが実行
+  // 即時スリープは予約を上書きする（エージェント側も cancel_defer する）
+  try { localStorage.removeItem("defer_due"); } catch (e) {}
   setStatus("wait", "スリープ中…");
   setTimeout(refresh, 6000);
 });
+
+// ── 退勤ボタン（遅延スリープ予約）────────────────────────────────────────────
+// pcsleep へ "sleep_in <分>" を publish → エージェントが「<分>経過 かつ アイドル
+// DEFER_IDLE_MIN 分」でスリープ。カウントダウン中の操作は「取消」ではなく「延期」。
+// 表示は端末ローカル（localStorage）で、真実はエージェント側にある。別端末で予約
+// した分はここには出ないが、取消は publish なのでどの端末からでも効く。
+var leaveB      = document.getElementById("leave");
+var deferRow    = document.getElementById("defer-row");
+var deferText   = document.getElementById("defer-text");
+var deferCancel = document.getElementById("defer-cancel");
+
+function deferDue() {
+  var v = Number(localStorage.getItem("defer_due") || 0);
+  // 予約から DEFER_MIN + 猶予4時間（エージェントの DEFER_MAX_MIN）を過ぎたら表示を畳む
+  return (v && Date.now() < v + 4 * 3600 * 1000) ? v : 0;
+}
+function renderDefer() {
+  var due = deferDue();
+  if (!due) { deferRow.classList.remove("visible"); return; }
+  deferRow.classList.add("visible");
+  var left = Math.round((due - Date.now()) / 1000);
+  if (left > 0) {
+    var m = Math.floor(left / 60), s = left % 60;
+    deferText.textContent = "💤 予約中 残り " + m + ":" + (s < 10 ? "0" : "") + s;
+  } else {
+    deferText.textContent = "💤 予約中 アイドル" + DEFER_IDLE_MIN + "分で実行";
+  }
+}
+leaveB.addEventListener("click", function () {
+  publish("sleep_in " + DEFER_MIN, SLEEP_RES);
+  try { localStorage.setItem("defer_due", String(Date.now() + DEFER_MIN * 60000)); } catch (e) {}
+  logLine("退勤予約: " + DEFER_MIN + "分後 + アイドル" + DEFER_IDLE_MIN + "分");
+  renderDefer();
+});
+deferCancel.addEventListener("click", function () {
+  publish("cancel", SLEEP_RES);
+  try { localStorage.removeItem("defer_due"); } catch (e) {}
+  logLine("退勤予約を取消");
+  renderDefer();
+});
+renderDefer();
+setInterval(renderDefer, 1000);
 
 // ── GPIO 最終手段ボタン ──────────────────────────────────────────────────────
 // エージェントが down のときだけ表示（readAgent が制御）。

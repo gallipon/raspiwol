@@ -6,6 +6,13 @@ Subscribes to Beebotte raspi3b/pcsleep and, when it receives data == "sleep",
 suspends this PC. The dashboard's Sleep button and the Slack "owari" webhook
 both publish "sleep" to that resource.
 
+It also accepts a deferred sleep, "sleep_in <minutes>" (dashboard 退勤 button /
+pcsleep_cmd.py), for office days when no Slack "終了" is posted: after the delay
+elapses it waits until the user has also been idle for DEFER_IDLE_MIN minutes,
+then suspends.  Late input postpones the suspend instead of cancelling it, so
+the PC never sleeps under your hands but always sleeps once you have left.
+"cancel" clears a pending reservation.
+
 It also runs a local auto-sleep loop: on weekdays, at/after the work-end hour,
 if the user has been idle long enough, it suspends the PC -- but only while the
 "autopilot" master switch (raspi3b/autopilot) is on. The switch is read once at
@@ -84,7 +91,20 @@ IDLE_MIN    = 60    # required minutes with no keyboard/mouse input
 CHECK_SEC   = 60    # how often the auto-sleep loop evaluates
 COOLDOWN_SEC = 300  # grace after an auto-sleep/resume before considering again
 
+# Deferred sleep ("sleep_in <min>") -- the office-day counterpart of Slack "終了".
+DEFER_DEFAULT_MIN = 10    # delay used when no minutes are given
+DEFER_IDLE_MIN    = 5     # after the delay, also require this much idle time
+DEFER_MAX_MIN     = 240   # a reservation older than this is dropped (safety:
+                          # a forgotten one must not suspend the PC next morning)
+DEFER_CHECK_SEC   = 20    # how often the deferred loop evaluates
+
 autopilot_on = True   # cached switch state; default on (automation enabled)
+
+# Pending deferred sleep. defer_due = epoch when the delay elapses (0 = none),
+# defer_expire = epoch when the reservation is dropped unfired.
+# Plain float assignment is atomic under the GIL -- no lock needed.
+defer_due    = 0.0
+defer_expire = 0.0
 
 # last_rx: wall-clock time of the most recent inbound MQTT message.
 # Updated in on_message (any topic) and on_connect.  Read in the monitor loop.
@@ -166,6 +186,55 @@ def autopilot_loop():
         time.sleep(CHECK_SEC)
 
 
+def arm_defer(minutes):
+    """Arm (or re-arm) a deferred sleep `minutes` from now."""
+    global defer_due, defer_expire
+    now = time.time()
+    defer_due    = now + minutes * 60
+    defer_expire = now + DEFER_MAX_MIN * 60
+    print("deferred sleep armed: %d min (idle %d min required after that)"
+          % (minutes, DEFER_IDLE_MIN))
+
+
+def cancel_defer(reason):
+    global defer_due, defer_expire
+    if defer_due:
+        print("deferred sleep cancelled (%s)" % reason)
+    defer_due = defer_expire = 0.0
+
+
+def defer_loop():
+    """Fire a pending deferred sleep once the delay AND the idle time are met.
+
+    Input during the countdown POSTPONES the suspend (it does not cancel it):
+    we keep waiting until idle_seconds() reaches DEFER_IDLE_MIN, so resuming
+    work after pressing 退勤 never sleeps the PC mid-keystroke, while walking
+    away always ends in a suspend.  Unlike autopilot_loop this ignores the
+    autopilot switch and the weekday/cutoff rules -- it is an explicit request.
+    """
+    while True:
+        time.sleep(DEFER_CHECK_SEC)
+        try:
+            if not defer_due:
+                continue
+            now = time.time()
+            if now > defer_expire:
+                cancel_defer("expired after %d min unfired" % DEFER_MAX_MIN)
+                continue
+            if now < defer_due:
+                continue
+            idle = idle_seconds()
+            if idle < DEFER_IDLE_MIN * 60:
+                continue   # still in use -- postpone, re-check next cycle
+            print("deferred sleep: delay elapsed and idle %.0f min -> suspend"
+                  % (idle / 60))
+            cancel_defer("fired")
+            sleep_pc()
+            time.sleep(COOLDOWN_SEC)
+        except Exception as e:
+            print("defer loop error: " + str(e), file=sys.stderr)
+
+
 def heartbeat_loop(client):
     """Publish a timestamped heartbeat to AGENT_TOPIC every HEARTBEAT_SEC.
 
@@ -221,7 +290,25 @@ def on_message(client, userdata, msg):
 
     if val == "sleep":   # dashboard / Slack: always honored (explicit intent)
         print("sleep command received -> suspending")
+        cancel_defer("superseded by immediate sleep")
         sleep_pc()
+        return
+
+    if val == "cancel":                       # clear a pending reservation
+        cancel_defer("cancel command received")
+        return
+
+    if val.startswith("sleep_in"):            # "sleep_in" | "sleep_in 20"
+        arg = val[len("sleep_in"):].strip()
+        try:
+            minutes = int(arg) if arg else DEFER_DEFAULT_MIN
+        except ValueError:
+            print("bad sleep_in argument: " + arg, file=sys.stderr)
+            return
+        if not 0 < minutes <= DEFER_MAX_MIN:
+            print("sleep_in out of range: %d" % minutes, file=sys.stderr)
+            return
+        arm_defer(minutes)
 
 
 # ── MQTT client setup ─────────────────────────────────────────────────────────
@@ -298,6 +385,7 @@ def monitor_loop(client):
 def main():
     read_autopilot()
     threading.Thread(target=autopilot_loop, daemon=True).start()
+    threading.Thread(target=defer_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, args=(client,), daemon=True).start()
 
     # Initial connect; the monitor loop keeps it alive from here on.
