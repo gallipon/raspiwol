@@ -6,15 +6,17 @@
  * アプリはチャンネルに参加せず、他のメンバーには一切見えない。新規の自分の
  * 「終了」投稿を見つけたら Beebotte raspi3b/pcsleep へ "sleep" を publish する。
  *
- * cron で1分ごとに実行（VPS）:
- *   * * * * * /usr/bin/php /var/www/.../slack_sleep_poll.php >/dev/null 2>&1
+ * cron で10分ごとに実行（VPS。投稿から寝るまで最大10分遅れる）:
+ *   0,10,20,30,40,50 * * * * /usr/bin/php /var/www/.../slack_sleep_poll.php >/dev/null 2>&1
  *
  * 認証情報・サイト固有設定は別ファイル slack_sleep_config.php に分離する（同じ
  * ディレクトリに置く）。その実体はリポジトリに commit しない（.gitignore 済み）。
  * テンプレートは slack_sleep_config.example.php をコピーして使う。
  * STATE_FILE は cron 実行ユーザーが書き込めるパスにする。
  *
- * 注意: autopilot スイッチとは独立（明示的な退勤操作なので OFF でも常に寝かせる＝案A）。
+ * autopilot スイッチ（raspi3b/autopilot）が "off" のときは「終了」を検出しても寝かせない
+ * （2026-09-17 変更。休暇・残業などで OFF にした日に Slack 経由で寝るのを防ぐ）。
+ * 未作成(404)は従来どおり on 扱い。読み取り失敗時は watermark を進めず次回再判定する。
  */
 
 // 認証情報・サイト固有設定を読み込む（SLACK_USER_TOKEN / BEEBOTTE_TOKEN /
@@ -23,6 +25,7 @@ require __DIR__ . "/slack_sleep_config.php";
 
 const HIST_URL = "https://slack.com/api/conversations.history";
 const PUB_URL  = "https://api.beebotte.com/v1/data/publish/raspi3b/pcsleep";
+const AUTO_URL = "https://api.beebotte.com/v1/data/read/raspi3b/autopilot?limit=1";
 
 function http_get($url, $headers) {
     $ch = curl_init($url);
@@ -34,6 +37,29 @@ function http_get($url, $headers) {
     $r = curl_exec($ch);
     curl_close($ch);
     return $r;
+}
+
+// autopilot スイッチを読む。"on" / "off" / null（読み取り失敗）を返す。
+// リソース未作成(404)は Pi/エージェントと同じく "on" 扱い。
+function read_autopilot() {
+    $ch = curl_init(AUTO_URL);
+    curl_setopt_array($ch, array(
+        CURLOPT_HTTPHEADER => array("X-Auth-Token: " . BEEBOTTE_TOKEN),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 5,
+        // publish と同じく api.beebotte.com の不完全チェーン回避（下の PUB 参照）
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => 0,
+    ));
+    $r = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($code === 404) return "on";
+    if ($code !== 200) return null;
+    $arr = json_decode($r, true);
+    if (!is_array($arr)) return null;
+    if (!isset($arr[0]["data"])) return "on";   // 値が一度も書かれていない
+    return strtolower(trim((string)$arr[0]["data"])) === "off" ? "off" : "on";
 }
 
 // 監視の起点(watermark)。初回は「今」にして過去の投稿で誤発火しないようにする。
@@ -66,6 +92,16 @@ foreach ($messages as $m) {
         && mb_strpos($text, TRIGGER) !== false) {
         $hit = true;
     }
+}
+
+if ($hit) {
+    $auto = read_autopilot();
+    if ($auto === null) {
+        // 判定できない: watermark を進めずに抜け、次回の cron で再判定する
+        fwrite(STDERR, "autopilot read failed; retry next run\n");
+        exit(1);
+    }
+    if ($auto === "off") $hit = false;             // OFF の日は「終了」でも寝かせない
 }
 
 if ($hit) {
