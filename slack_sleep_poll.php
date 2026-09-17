@@ -4,7 +4,12 @@
  *
  * Bot ではなく「自分の User トークン」で conversations.history を読むだけなので、
  * アプリはチャンネルに参加せず、他のメンバーには一切見えない。新規の自分の
- * 「終了」投稿を見つけたら Beebotte raspi3b/pcsleep へ "sleep" を publish する。
+ * 「終了」投稿を見つけたら Beebotte raspi3b/pcsleep へ SLEEP_CMD を publish する。
+ *
+ * 即時の "sleep" ではなく退勤予約 "sleep_in 1" を送る（2026-09-17 変更）。"sleep" は
+ * エージェントが無条件に寝かせるため、Claude Code の作業中でも寝てしまっていた。
+ * 予約はエージェント側で「1分経過＋無操作5分＋Claude Code 非稼働（最長180分で打ち切り）」
+ * を満たしたときに発火する。ダッシュボードの Sleep ボタンは従来どおり即時。
  *
  * cron で10分ごとに実行（VPS。投稿から寝るまで最大10分遅れる）:
  *   0,10,20,30,40,50 * * * * /usr/bin/php /var/www/.../slack_sleep_poll.php >/dev/null 2>&1
@@ -26,6 +31,7 @@ require __DIR__ . "/slack_sleep_config.php";
 const HIST_URL = "https://slack.com/api/conversations.history";
 const PUB_URL  = "https://api.beebotte.com/v1/data/publish/raspi3b/pcsleep";
 const AUTO_URL = "https://api.beebotte.com/v1/data/read/raspi3b/autopilot?limit=1";
+const SLEEP_CMD = "sleep_in 1";   // pcsleep_agent の退勤予約（分）。1〜240 の範囲で指定
 
 function http_get($url, $headers) {
     $ch = curl_init($url);
@@ -109,11 +115,11 @@ if ($hit) {
     curl_setopt_array($ch, array(
         CURLOPT_POST => true,
         CURLOPT_HTTPHEADER => array("X-Auth-Token: " . BEEBOTTE_TOKEN, "Content-Type: application/json"),
-        CURLOPT_POSTFIELDS => json_encode(array("data" => "sleep")),
+        CURLOPT_POSTFIELDS => json_encode(array("data" => SLEEP_CMD)),
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_TIMEOUT => 5,
         // api.beebotte.com への TLS 検証が失敗する（HTTP 0／chain 検証不可。Slack 等の
-        // 他ホストは通るのにここだけ失敗＝Pi の bbt_write と同じ事象）。"sleep" を投げる
+        // 他ホストは通るのにここだけ失敗＝Pi の bbt_write と同じ事象）。コマンドを投げる
         // だけの内部用途なので curl -k 相当で回避。正攻法は中間証明書/CAバンドルの整備。
         CURLOPT_SSL_VERIFYPEER => false,
         CURLOPT_SSL_VERIFYHOST => 0,
