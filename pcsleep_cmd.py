@@ -11,16 +11,21 @@
   python pcsleep_cmd.py cancel    # 予約取消
 
 BEEBOTTE_TOKEN 環境変数が必要（エージェントと同じトークン）。
-raspi_cmd.py と違い raspi3b/pcsleep へ publish する（Pi ではなく PC が受け取る）。
+
+raspi3b/pcsleep_req へ REST で write（永続）する。エージェントはこれを REST で
+ポーリングするため、Beebotte の MQTT が落ちていても届く（2026-09-22 の障害で
+MQTT publish 方式は全滅した）。pip 依存も無くなった（paho 不要）。
 """
 import json
 import os
+import ssl
 import sys
+import urllib.error
+import urllib.request
 
-import paho.mqtt.client as mqtt
-
-TOKEN = os.environ.get("BEEBOTTE_TOKEN", "")
-TOPIC = "raspi3b/pcsleep"
+TOKEN    = os.environ.get("BEEBOTTE_TOKEN", "")
+CHANNEL  = "raspi3b"
+RESOURCE = "pcsleep_req"
 DEFAULT_MIN = 10
 
 if not TOKEN:
@@ -40,17 +45,29 @@ else:
         sys.exit(1)
     cmd = "sleep_in %d" % minutes
 
-client = mqtt.Client(
-    callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-    client_id="pcsleep_cli",
-)
-client.username_pw_set(TOKEN)
-client.connect("mqtt.beebotte.com", 1883, keepalive=30)
-client.loop_start()
+# api.beebotte.com は中間証明書を送ってこないため OpenSSL の検証が通らない
+# （curl やブラウザは AIA で補完するので成功する）。エージェント側と同じ回避策。
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
 
-info = client.publish(TOPIC, json.dumps({"data": cmd}))
-info.wait_for_publish(timeout=10)   # QoS0: 送信完了までプロセスを落とさない
+req = urllib.request.Request(
+    "https://api.beebotte.com/v1/data/write/%s/%s" % (CHANNEL, RESOURCE),
+    data=json.dumps({"data": cmd}).encode(),
+    headers={"X-Auth-Token": TOKEN, "Content-Type": "application/json"},
+    method="POST")
+try:
+    with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
+        body = r.read().decode(errors="replace").strip()
+except urllib.error.HTTPError as e:
+    detail = e.read().decode(errors="replace").strip()
+    print("Error: write 失敗 HTTP %d %s" % (e.code, detail), file=sys.stderr)
+    if e.code == 404:
+        print("Beebotte コンソールで %s/%s リソースを作成してください"
+              % (CHANNEL, RESOURCE), file=sys.stderr)
+    sys.exit(1)
+except OSError as e:
+    print("Error: write 失敗 %s" % e, file=sys.stderr)
+    sys.exit(1)
 
-client.loop_stop()
-client.disconnect()
-print("→ %s: %s" % (TOPIC, cmd))
+print("→ %s/%s: %s (%s)" % (CHANNEL, RESOURCE, cmd, body))

@@ -24,6 +24,15 @@ hold off while any Claude Code session is still working, since GetLastInputInfo
 cannot see an unattended agent run and would suspend the PC mid-task. The
 explicit "sleep" command ignores this, just as it ignores the switch.
 
+Commands arrive over two paths.  Writers (dashboard, VPS Slack poller,
+pcsleep_cmd.py) WRITE their command to the persisted resource raspi3b/pcsleep_req
+and this agent polls it over REST every POLL_SEC.  MQTT delivery of that same
+write only nudges the poller, so a working broker keeps the response instant
+while REST alone is enough to function.  This exists because on 2026-09-22
+Beebotte's broker refused every new MQTT connection for days while its REST API
+kept working, which left all sleep paths dead.  The legacy raspi3b/pcsleep topic
+is still honored over MQTT for older senders.
+
 Zombie resilience: on sleep/resume the MQTT TCP connection can become half-open
 (the OS thinks it is connected but Beebotte has already dropped it). A watchdog
 monitor loop detects this via self-echo heartbeats (ZOMBIE_ECHO_CHECK) and
@@ -63,6 +72,17 @@ TOKEN    = os.environ.get("BEEBOTTE_TOKEN", "")
 CHANNEL  = "raspi3b"
 RESOURCE = "pcsleep"
 TOPIC    = CHANNEL + "/" + RESOURCE
+
+# REST command queue: senders write here (persisted), we poll it.  This is the
+# path that survives an MQTT outage; see the module docstring.
+REQ_RESOURCE = "pcsleep_req"
+REQ_TOPIC    = CHANNEL + "/" + REQ_RESOURCE
+POLL_SEC     = 20     # how often we poll the queue over REST
+CMD_MAX_AGE_SEC  = 300    # ignore a queued command older than this.  One written
+                          # while the PC slept must not suspend it again right
+                          # after a WOL wake.
+AUTO_REFRESH_SEC = 300    # re-read the autopilot switch this often, since MQTT
+                          # (the live path for switch changes) may be down
 
 # Master on/off switch (Beebotte resource shared with the dashboard and the Pi).
 AUTO_RESOURCE = "autopilot"
@@ -119,6 +139,14 @@ DEFER_MAX_MIN     = 240   # a reservation older than this is dropped (safety:
 DEFER_CHECK_SEC   = 20    # how often the deferred loop evaluates
 
 autopilot_on = True   # cached switch state; default on (automation enabled)
+
+# Highest command timestamp (ms, Beebotte's own) already handled.  0 = not yet
+# initialised; poll_loop seeds it from the queue so the backlog is skipped.
+cmd_watermark = 0.0
+# Set by on_message so an MQTT-delivered write polls immediately instead of
+# waiting out POLL_SEC.  The poller stays the only executor, so a command can
+# never run twice.
+poll_now = threading.Event()
 
 # Pending deferred sleep. defer_due = epoch when the delay elapses (0 = none),
 # defer_expire = epoch when the reservation is dropped unfired.
@@ -215,28 +243,34 @@ def cc_active():
     return True
 
 
-def read_autopilot():
-    """Read the current switch state once via Beebotte REST.
+def bbt_read(resource, limit=1):
+    """REST read of a persisted resource; returns Beebotte's list of records.
 
     api.beebotte.com serves an incomplete certificate chain, so Python's
     OpenSSL rejects it (CERTIFICATE_VERIFY_FAILED) even though curl/browsers
     pass via AIA fetching.  We disable verification here -- same workaround as
-    the Pi's bbt_write.  Without it this read always failed and fell back to
-    "on", which once caused an unexpected auto-sleep while the switch was off.
+    the Pi's bbt_write.  Without it the autopilot read always failed and fell
+    back to "on", which once caused an unexpected auto-sleep while it was off.
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(
+        "https://api.beebotte.com/v1/data/read/%s/%s?limit=%d"
+        % (CHANNEL, resource, limit))
+    req.add_header("X-Auth-Token", TOKEN)
+    with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+        return json.loads(r.read())
+
+
+def read_autopilot():
+    """Refresh the cached switch state from Beebotte.
 
     On failure we fail SAFE = off: a read error must never enable auto-sleep.
     """
     global autopilot_on
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
     try:
-        req = urllib.request.Request(
-            "https://api.beebotte.com/v1/data/read/%s/%s?limit=1"
-            % (CHANNEL, AUTO_RESOURCE))
-        req.add_header("X-Auth-Token", TOKEN)
-        with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
-            arr = json.loads(r.read())
+        arr = bbt_read(AUTO_RESOURCE, 1)
         if arr:
             autopilot_on = str(arr[0].get("data", "off")).strip().lower() == "on"
         print("autopilot initial state: " + ("on" if autopilot_on else "off"))
@@ -318,22 +352,46 @@ def defer_loop():
             print("defer loop error: " + str(e), file=sys.stderr)
 
 
+def bbt_write(resource, value):
+    """REST write (persisted) -- the fallback when MQTT is unavailable."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(
+        "https://api.beebotte.com/v1/data/write/%s/%s" % (CHANNEL, resource),
+        data=json.dumps({"data": value}).encode(),
+        headers={"X-Auth-Token": TOKEN, "Content-Type": "application/json"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+        r.read()
+
+
 def heartbeat_loop(client):
     """Publish a timestamped heartbeat to AGENT_TOPIC every HEARTBEAT_SEC.
 
     The dashboard reads this resource via REST to display agent liveness.
     write:True instructs Beebotte to persist the value (required for REST read).
+
+    Falls back to a REST write while MQTT is unusable -- otherwise an outage
+    makes the agent look dead even though it is serving REST commands, which is
+    exactly when its liveness matters most.  The MQTT publish also doubles as
+    the self-echo the monitor loop uses, so it stays the preferred path.
     """
     while True:
         time.sleep(HEARTBEAT_SEC)
         try:
             payload = json.dumps({"data": int(time.time()), "write": True})
             rc = client.publish(AGENT_TOPIC, payload)
-            if rc.rc != mqtt.MQTT_ERR_SUCCESS:
-                print("heartbeat publish failed rc=%d" % rc.rc, file=sys.stderr)
+            if rc.rc == mqtt.MQTT_ERR_SUCCESS and client.is_connected():
+                continue
+            print("heartbeat over MQTT unavailable (rc=%d) -- writing via REST"
+                  % rc.rc, file=sys.stderr)
         except Exception as e:
             print("heartbeat error: " + str(e), file=sys.stderr)
-            # The monitor loop will detect the disconnect and reconnect.
+        try:
+            bbt_write(AGENT_RESOURCE, int(time.time()))
+        except Exception as e:
+            print("heartbeat REST write failed: " + str(e), file=sys.stderr)
 
 
 # ── MQTT callbacks ────────────────────────────────────────────────────────────
@@ -342,9 +400,11 @@ def on_connect(client, userdata, flags, reason_code, properties):
     global last_rx
     last_rx = time.time()   # reset stale timer on successful (re)connect
     client.subscribe(TOPIC)
+    client.subscribe(REQ_TOPIC)
     client.subscribe(AUTO_TOPIC)
     client.subscribe(AGENT_TOPIC)   # subscribe to own topic for self-echo detection
-    print("connected; subscribed %s, %s, %s" % (TOPIC, AUTO_TOPIC, AGENT_TOPIC))
+    print("connected; subscribed %s, %s, %s, %s"
+          % (TOPIC, REQ_TOPIC, AUTO_TOPIC, AGENT_TOPIC))
 
 
 def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
@@ -352,25 +412,8 @@ def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
           file=sys.stderr)
 
 
-def on_message(client, userdata, msg):
-    global autopilot_on, last_rx
-    last_rx = time.time()   # any inbound message keeps the zombie timer alive
-
-    try:
-        data = json.loads(msg.payload).get("data", "")
-    except Exception:
-        data = msg.payload.decode(errors="replace")
-    val = str(data).strip().lower()
-
-    # Self-echo from our own heartbeat publish -- just a liveness ping, ignore.
-    if msg.topic == AGENT_TOPIC:
-        return
-
-    if msg.topic == AUTO_TOPIC:
-        autopilot_on = (val == "on")
-        print("autopilot -> " + ("on" if autopilot_on else "off"))
-        return
-
+def handle_command(val):
+    """Act on one command string, whichever path delivered it."""
     if val == "sleep":   # dashboard / Slack: always honored (explicit intent)
         print("sleep command received -> suspending")
         cancel_defer("superseded by immediate sleep")
@@ -392,6 +435,86 @@ def on_message(client, userdata, msg):
             print("sleep_in out of range: %d" % minutes, file=sys.stderr)
             return
         arm_defer(minutes)
+        return
+
+    print("unknown command ignored: " + val, file=sys.stderr)
+
+
+def poll_loop():
+    """Poll the REST command queue; the only executor of queued commands.
+
+    MQTT delivery of a queue write merely sets poll_now, so a command is acted
+    on exactly once no matter how many paths carried it.  The watermark is
+    advanced BEFORE acting because a suspend blocks inside handle_command until
+    the PC resumes -- on resume the same entry must not fire again.
+    """
+    global cmd_watermark
+
+    # Seed the watermark: whatever is already queued at startup is history.
+    while not cmd_watermark:
+        try:
+            arr = bbt_read(REQ_RESOURCE, 1)
+            cmd_watermark = float(arr[0]["ts"]) if arr else time.time() * 1000.0
+            print("command queue ready (watermark %.0f)" % cmd_watermark)
+        except Exception as e:
+            print("command queue unavailable (%s) -- create the '%s' resource in "
+                  "the Beebotte console; retrying" % (e, REQ_RESOURCE),
+                  file=sys.stderr)
+            time.sleep(POLL_SEC)
+
+    last_auto = time.time()
+    while True:
+        poll_now.wait(POLL_SEC)
+        poll_now.clear()
+        try:
+            if time.time() - last_auto >= AUTO_REFRESH_SEC:
+                read_autopilot()     # MQTT may be down, so refresh it here too
+                last_auto = time.time()
+            entries = bbt_read(REQ_RESOURCE, 5)
+        except Exception as e:
+            print("command poll failed: " + str(e), file=sys.stderr)
+            continue
+
+        for rec in sorted(entries, key=lambda x: x.get("ts", 0)):
+            ts = float(rec.get("ts", 0))
+            if ts <= cmd_watermark:
+                continue
+            cmd_watermark = ts
+            val = str(rec.get("data", "")).strip().lower()
+            age = time.time() - ts / 1000.0
+            if age > CMD_MAX_AGE_SEC:
+                print("stale command ignored (%d min old): %s" % (age / 60, val))
+                continue
+            print("command via REST: " + val)
+            handle_command(val)
+
+
+def on_message(client, userdata, msg):
+    global autopilot_on, last_rx
+    last_rx = time.time()   # any inbound message keeps the zombie timer alive
+
+    try:
+        data = json.loads(msg.payload).get("data", "")
+    except Exception:
+        data = msg.payload.decode(errors="replace")
+    val = str(data).strip().lower()
+
+    # Self-echo from our own heartbeat publish -- just a liveness ping, ignore.
+    if msg.topic == AGENT_TOPIC:
+        return
+
+    if msg.topic == AUTO_TOPIC:
+        autopilot_on = (val == "on")
+        print("autopilot -> " + ("on" if autopilot_on else "off"))
+        return
+
+    # A queue write also arrives here: poll right away instead of executing, so
+    # the poller's watermark stays the single guard against double execution.
+    if msg.topic == REQ_TOPIC:
+        poll_now.set()
+        return
+
+    handle_command(val)   # legacy raspi3b/pcsleep senders
 
 
 # ── MQTT client setup ─────────────────────────────────────────────────────────
@@ -470,6 +593,9 @@ def main():
     threading.Thread(target=autopilot_loop, daemon=True).start()
     threading.Thread(target=defer_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, args=(client,), daemon=True).start()
+    # Started before the connect loop below: with the broker refusing
+    # connections, REST polling is the only working path and must not wait.
+    threading.Thread(target=poll_loop, daemon=True).start()
 
     # Initial connect; the monitor loop keeps it alive from here on.
     while True:
