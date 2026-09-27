@@ -113,7 +113,9 @@ var CHANNEL   = "raspi3b";
 var CMD_RES   = "wol";          // コマンド送信先（raspi3b/wol）
 var POWER_RES = "power";        // ステータス受信元（raspi3b/power）※Beebotteに作成要
 var TARGET_IP = "192.168.1.50"; // 対象 PC の固定 IP（ping 対象。デプロイ時に実IPへ）
-var SLEEP_RES = "pcsleep";      // PC スリープ指示先（raspi3b/pcsleep）→ PC 常駐エージェントが購読
+var SLEEP_RES = "pcsleep_req";  // PC スリープ指示先（raspi3b/pcsleep_req）※Beebotteに作成要
+                                // write（永続）で送る。エージェントは REST で取りに来るので
+                                // Beebotte の MQTT が落ちていても届く（2026-09-22 の障害対策）
 var AUTO_RES  = "autopilot";    // 自動Wake/Sleep のマスタースイッチ（raspi3b/autopilot）※Beebotteに作成要
 var WAKE_CMD  = "officepc";   // WOL マジックパケット送信（raspi3b/wol へ）
 var SLEEP_CMD = "sleep";        // PC エージェントが解釈するスリープ指示（SetSuspendState）
@@ -121,6 +123,9 @@ var DEFER_MIN  = 10;            // 退勤ボタンの遅延（分）→ "sleep_i
 var DEFER_IDLE_MIN = 5;         // 遅延経過後に必要なアイドル分数（エージェント側の定数と揃える・表示用）
 var AGENT_RES      = "agent";   // PC エージェントのハートビートリソース（raspi3b/agent）※Beebotteに作成要
 var AGENT_STALE_MS = 150000;    // この秒数（150秒）を超えて未更新なら agent down 判定
+var POWER_STALE_MS = 60000;     // power がこの時間（60秒＝ping 5周期）更新されていなければ
+                                // ON/OFF を出さず「不明」にする。Pi が ping を実行できない間、
+                                // 古い値を現状として表示してしまうため（2026-09-22 に誤認した）
 var POLL_MS   = 12000;          // ステータス更新間隔
 var REPLY_MS  = 2000;           // ping 送信→Pi の write 完了を待つ猶予
 
@@ -166,6 +171,21 @@ function publish(cmd, res) {
     if (!r.ok) logLine("publish 失敗 HTTP " + r.status);
     return r;
   }).catch(function (e) { logLine("publish エラー: " + e.message); });
+}
+
+// スリープ系のコマンドは write（永続）で送る。publish は購読者が居なければ消えるが、
+// write は残るのでエージェントが REST ポーリングで拾える（MQTT 障害時の生命線）。
+function sendCmd(cmd) {
+  logLine("→ " + SLEEP_RES + ": " + cmd);
+  return fetch(API + "/write/" + CHANNEL + "/" + SLEEP_RES, {
+    method: "POST",
+    headers: { "X-Auth-Token": TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify({ data: cmd })
+  }).then(function (r) {
+    if (r.status === 404) logLine("Beebotte に " + SLEEP_RES + " リソースを作成してください");
+    else if (!r.ok) logLine("write 失敗 HTTP " + r.status);
+    return r;
+  }).catch(function (e) { logLine("write エラー: " + e.message); });
 }
 
 function readPower() {
@@ -228,10 +248,28 @@ function readAgent() {
 // 前面タブ かつ ウィンドウにフォーカスがある時だけ叩く（別アプリ作業中・別タブ・最小化では止める）
 function active() { return !document.hidden && document.hasFocus(); }
 
+function fmtAge(ms) {
+  var s = Math.round(ms / 1000);
+  if (s < 90) return s + "秒前";
+  if (s < 5400) return Math.round(s / 60) + "分前";
+  return Math.round(s / 3600) + "時間前";
+}
+
+// power は「Pi が ping を実行した結果」なので、Pi 側が止まっていると値が更新されない。
+// その古い値を ON/OFF として出すと「ONなのに寝ている」という誤表示になるため、
+// POWER_STALE_MS を超えた値は状態として扱わず、前回値として添えるだけにする。
 function renderPower(arr) {
   if (!Array.isArray(arr) || !arr[0]) return;
   var v = arr[0].data;
-  logLine("power = " + v);
+  var age = Date.now() - Number(arr[0].ts || 0);
+  logLine("power = " + v + "（" + fmtAge(age) + "）");
+  if (age > POWER_STALE_MS) {
+    setStatus("wait", "不明");
+    conn.textContent = "Pi から応答なし / 前回値 "
+      + (v === "up" ? "ON" : v === "down" ? "OFF" : String(v))
+      + "（" + fmtAge(age) + "）";
+    return;
+  }
   if (v === "up")        { setStatus("up", "ON");  conn.textContent = "接続OK"; }
   else if (v === "down") { setStatus("down", "OFF"); conn.textContent = "接続OK"; }
 }
@@ -263,7 +301,7 @@ wakeB.addEventListener("click", function () {
 
 sleepB.addEventListener("click", function () {
   if (!confirm("officepc をスリープさせますか？")) return;
-  publish(SLEEP_CMD, SLEEP_RES);   // pcsleep リソースへ "sleep" → PC エージェントが実行
+  sendCmd(SLEEP_CMD);              // pcsleep_req へ "sleep" → PC エージェントが実行
   // 即時スリープは予約を上書きする（エージェント側も cancel_defer する）
   try { localStorage.removeItem("defer_due"); } catch (e) {}
   setStatus("wait", "スリープ中…");
@@ -271,10 +309,10 @@ sleepB.addEventListener("click", function () {
 });
 
 // ── 退勤ボタン（遅延スリープ予約）────────────────────────────────────────────
-// pcsleep へ "sleep_in <分>" を publish → エージェントが「<分>経過 かつ アイドル
+// pcsleep_req へ "sleep_in <分>" を write → エージェントが「<分>経過 かつ アイドル
 // DEFER_IDLE_MIN 分」でスリープ。カウントダウン中の操作は「取消」ではなく「延期」。
 // 表示は端末ローカル（localStorage）で、真実はエージェント側にある。別端末で予約
-// した分はここには出ないが、取消は publish なのでどの端末からでも効く。
+// した分はここには出ないが、取消は Beebotte 経由なのでどの端末からでも効く。
 var leaveB      = document.getElementById("leave");
 var deferRow    = document.getElementById("defer-row");
 var deferText   = document.getElementById("defer-text");
@@ -298,13 +336,13 @@ function renderDefer() {
   }
 }
 leaveB.addEventListener("click", function () {
-  publish("sleep_in " + DEFER_MIN, SLEEP_RES);
+  sendCmd("sleep_in " + DEFER_MIN);
   try { localStorage.setItem("defer_due", String(Date.now() + DEFER_MIN * 60000)); } catch (e) {}
   logLine("退勤予約: " + DEFER_MIN + "分後 + アイドル" + DEFER_IDLE_MIN + "分");
   renderDefer();
 });
 deferCancel.addEventListener("click", function () {
-  publish("cancel", SLEEP_RES);
+  sendCmd("cancel");
   try { localStorage.removeItem("defer_due"); } catch (e) {}
   logLine("退勤予約を取消");
   renderDefer();

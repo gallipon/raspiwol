@@ -4,7 +4,7 @@
  *
  * Bot ではなく「自分の User トークン」で conversations.history を読むだけなので、
  * アプリはチャンネルに参加せず、他のメンバーには一切見えない。新規の自分の
- * 「終了」投稿を見つけたら Beebotte raspi3b/pcsleep へ SLEEP_CMD を publish する。
+ * 「終了」投稿を見つけたら Beebotte raspi3b/pcsleep_req へ SLEEP_CMD を write する。
  *
  * 即時の "sleep" ではなく退勤予約 "sleep_in 1" を送る（2026-09-17 変更）。"sleep" は
  * エージェントが無条件に寝かせるため、Claude Code の作業中でも寝てしまっていた。
@@ -29,7 +29,9 @@
 require __DIR__ . "/slack_sleep_config.php";
 
 const HIST_URL = "https://slack.com/api/conversations.history";
-const PUB_URL  = "https://api.beebotte.com/v1/data/publish/raspi3b/pcsleep";
+// publish ではなく write（永続）。エージェントはこのリソースを REST でポーリング
+// するので、Beebotte の MQTT が落ちていても届く（2026-09-22 の障害対策）。
+const PUB_URL  = "https://api.beebotte.com/v1/data/write/raspi3b/pcsleep_req";
 const AUTO_URL = "https://api.beebotte.com/v1/data/read/raspi3b/autopilot?limit=1";
 const SLEEP_CMD = "sleep_in 1";   // pcsleep_agent の退勤予約（分）。1〜240 の範囲で指定
 
