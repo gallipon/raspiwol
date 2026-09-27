@@ -123,6 +123,9 @@ var DEFER_MIN  = 10;            // 退勤ボタンの遅延（分）→ "sleep_i
 var DEFER_IDLE_MIN = 5;         // 遅延経過後に必要なアイドル分数（エージェント側の定数と揃える・表示用）
 var AGENT_RES      = "agent";   // PC エージェントのハートビートリソース（raspi3b/agent）※Beebotteに作成要
 var AGENT_STALE_MS = 150000;    // この秒数（150秒）を超えて未更新なら agent down 判定
+var POWER_STALE_MS = 60000;     // power がこの時間（60秒＝ping 5周期）更新されていなければ
+                                // ON/OFF を出さず「不明」にする。Pi が ping を実行できない間、
+                                // 古い値を現状として表示してしまうため（2026-09-22 に誤認した）
 var POLL_MS   = 12000;          // ステータス更新間隔
 var REPLY_MS  = 2000;           // ping 送信→Pi の write 完了を待つ猶予
 
@@ -245,10 +248,28 @@ function readAgent() {
 // 前面タブ かつ ウィンドウにフォーカスがある時だけ叩く（別アプリ作業中・別タブ・最小化では止める）
 function active() { return !document.hidden && document.hasFocus(); }
 
+function fmtAge(ms) {
+  var s = Math.round(ms / 1000);
+  if (s < 90) return s + "秒前";
+  if (s < 5400) return Math.round(s / 60) + "分前";
+  return Math.round(s / 3600) + "時間前";
+}
+
+// power は「Pi が ping を実行した結果」なので、Pi 側が止まっていると値が更新されない。
+// その古い値を ON/OFF として出すと「ONなのに寝ている」という誤表示になるため、
+// POWER_STALE_MS を超えた値は状態として扱わず、前回値として添えるだけにする。
 function renderPower(arr) {
   if (!Array.isArray(arr) || !arr[0]) return;
   var v = arr[0].data;
-  logLine("power = " + v);
+  var age = Date.now() - Number(arr[0].ts || 0);
+  logLine("power = " + v + "（" + fmtAge(age) + "）");
+  if (age > POWER_STALE_MS) {
+    setStatus("wait", "不明");
+    conn.textContent = "Pi から応答なし / 前回値 "
+      + (v === "up" ? "ON" : v === "down" ? "OFF" : String(v))
+      + "（" + fmtAge(age) + "）";
+    return;
+  }
   if (v === "up")        { setStatus("up", "ON");  conn.textContent = "接続OK"; }
   else if (v === "down") { setStatus("down", "OFF"); conn.textContent = "接続OK"; }
 }
