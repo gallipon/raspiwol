@@ -54,6 +54,8 @@ Autostart (Task Scheduler):
   - Action: pythonw.exe <full path to this file>   (pythonw = no console window)
   - "Run only when user is logged on"
   - Put BEEBOTTE_TOKEN in the user env vars:  setx BEEBOTTE_TOKEN token_XXXX
+  - Optional, self-hosted broker (parallel run with Beebotte):
+      setx PCSLEEP_MQTT_PASS <password of the "agent" user>
 """
 import ctypes
 import datetime
@@ -91,6 +93,20 @@ AUTO_TOPIC    = CHANNEL + "/" + AUTO_RESOURCE
 # Heartbeat / zombie-detection resource (agent liveness, read by the dashboard).
 AGENT_RESOURCE   = "agent"
 AGENT_TOPIC      = CHANNEL + "/" + AGENT_RESOURCE
+
+# Self-hosted broker (VPS Mosquitto behind Apache), run alongside Beebotte while
+# we migrate off it (Beebotte's certificate expired on 2026-11-17 and was not
+# renewed).  Enabled only when PCSLEEP_MQTT_PASS is set, so an agent without it
+# behaves exactly as before.  Nothing on this path may disturb the Beebotte one.
+#   raspi3b/pcsleep_req  retained, {"data": cmd, "ts": ms}  (dashboard2 / Slack)
+#   raspi3b/autopilot    retained, {"data": "on"|"off"}     -- wins over Beebotte
+#                        once it has been received
+#   raspi3b/agent        retained heartbeat, {"data": epoch_sec}
+MQ_HOST     = os.environ.get("PCSLEEP_MQTT_HOST", "gallipon.f5.si")
+MQ_PATH     = "/mqtt"
+MQ_USER     = "agent"
+MQ_PASS     = os.environ.get("PCSLEEP_MQTT_PASS", "")
+MQ_KEEPALIVE_SEC = 60     # Apache's proxy timeout is 300 s, well above this
 
 # Connection tuning.
 KEEPALIVE_SEC    = 20     # short keepalive speeds up half-open detection by the broker
@@ -143,6 +159,19 @@ DEFER_MAX_MIN     = 240   # a reservation older than this is dropped (safety:
 DEFER_CHECK_SEC   = 20    # how often the deferred loop evaluates
 
 autopilot_on = True   # cached switch state; default on (automation enabled)
+# True once the self-hosted broker has delivered the switch.  From then on its
+# value is the truth and Beebotte's (REST refresh or MQTT) is ignored.
+auto_from_mq = False
+
+# Self-hosted broker command guard, separate from cmd_watermark: its ts comes
+# from the sender's clock, not Beebotte's.  Until mq_seeded, a RETAINED
+# pcsleep_req (the copy the broker hands over on subscribe) is history, exactly
+# like the REST queue's backlog at start-up.  mq_seeded turns True on the first
+# live message or MQ_SEED_SEC after the first connect, so a command retained
+# while a later reconnect was pending is still executed.
+mq_watermark = 0.0
+mq_seeded    = False
+MQ_SEED_SEC  = 10
 
 # Highest command timestamp (ms, Beebotte's own) already handled.  0 = not yet
 # initialised; poll_loop seeds it from the queue so the backlog is skipped.
@@ -329,6 +358,8 @@ def read_autopilot():
     On failure we fail SAFE = off: a read error must never enable auto-sleep.
     """
     global autopilot_on
+    if auto_from_mq:
+        return             # the self-hosted broker owns the switch now
     try:
         arr = bbt_read(AUTO_RESOURCE, 1)
         if arr:
@@ -564,6 +595,8 @@ def on_message(client, userdata, msg):
         return
 
     if msg.topic == AUTO_TOPIC:
+        if auto_from_mq:
+            return         # the self-hosted broker owns the switch now
         autopilot_on = (val == "on")
         print("autopilot -> " + ("on" if autopilot_on else "off"))
         return
@@ -648,7 +681,108 @@ def monitor_loop(client):
             print("monitor loop error: " + str(e), file=sys.stderr)
 
 
+# ── Self-hosted broker (parallel run) ─────────────────────────────────────────
+# paho's own loop reconnects this client; the Beebotte monitor/zombie logic does
+# not touch it.  Every callback swallows its own errors so a fault here cannot
+# take the Beebotte path down with it.
+
+MQ_REQ_TOPIC  = REQ_TOPIC
+MQ_AUTO_TOPIC = AUTO_TOPIC
+MQ_AGENT_TOPIC = AGENT_TOPIC
+
+
+def _mq_mark_seeded():
+    global mq_seeded
+    mq_seeded = True
+
+
+def mq_on_connect(client, userdata, flags, reason_code, properties):
+    if reason_code.is_failure:
+        print("mq: connect refused (%s)" % reason_code, file=sys.stderr)
+        return
+    client.subscribe([(MQ_REQ_TOPIC, 1), (MQ_AUTO_TOPIC, 1)])
+    print("mq: connected to %s; subscribed %s, %s" % (MQ_HOST, MQ_REQ_TOPIC, MQ_AUTO_TOPIC))
+    if not mq_seeded:
+        threading.Timer(MQ_SEED_SEC, _mq_mark_seeded).start()
+
+
+def mq_on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+    print("mq: disconnected (rc=%s); paho will reconnect" % reason_code, file=sys.stderr)
+
+
+def mq_on_message(client, userdata, msg):
+    global autopilot_on, auto_from_mq, mq_watermark, mq_seeded
+    try:
+        if not msg.payload:
+            return                                   # retained copy deleted
+        body = json.loads(msg.payload)
+        val  = str(body.get("data", "")).strip().lower()
+
+        if msg.topic == MQ_AUTO_TOPIC:
+            autopilot_on = (val == "on")
+            if not auto_from_mq:
+                print("mq: taking over the autopilot switch from Beebotte")
+            auto_from_mq = True
+            print("autopilot -> %s (mq)" % ("on" if autopilot_on else "off"))
+            return
+
+        if msg.topic != MQ_REQ_TOPIC:
+            return
+        ts = float(body.get("ts", 0))
+        if msg.retain and not mq_seeded:
+            mq_watermark = max(mq_watermark, ts)     # start-up backlog: history
+            mq_seeded = True
+            print("mq: command queue ready (watermark %.0f)" % mq_watermark)
+            return
+        mq_seeded = True
+        if ts <= mq_watermark:
+            return                                   # already handled (redelivery)
+        mq_watermark = ts                            # advance BEFORE acting, see poll_loop
+        age = time.time() - ts / 1000.0
+        if age > CMD_MAX_AGE_SEC:
+            print("mq: stale command ignored (%d min old): %s" % (age / 60, val))
+            return
+        print("command via mq: " + val)
+        # handle_command may block in SetSuspendState; run it off paho's thread
+        # so the connection keeps being serviced across the suspend.
+        threading.Thread(target=handle_command, args=(val,), daemon=True).start()
+    except Exception as e:
+        print("mq: message error: " + str(e), file=sys.stderr)
+
+
+def mq_heartbeat_loop(client):
+    while True:
+        time.sleep(HEARTBEAT_SEC)
+        try:
+            client.publish(MQ_AGENT_TOPIC, json.dumps({"data": int(time.time())}),
+                           qos=0, retain=True)
+        except Exception as e:
+            print("mq: heartbeat error: " + str(e), file=sys.stderr)
+
+
+def start_mq():
+    """Start the self-hosted broker client, or do nothing if it is not configured."""
+    if not MQ_PASS:
+        print("mq: PCSLEEP_MQTT_PASS not set -- self-hosted broker disabled")
+        return
+    try:
+        c = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                        client_id="pcsleep_agent", transport="websockets")
+        c.ws_set_options(path=MQ_PATH)
+        c.tls_set()                                  # Let's Encrypt, verified
+        c.username_pw_set(MQ_USER, MQ_PASS)
+        c.reconnect_delay_set(min_delay=1, max_delay=60)
+        c.on_connect, c.on_disconnect, c.on_message = (
+            mq_on_connect, mq_on_disconnect, mq_on_message)
+        c.connect_async(MQ_HOST, 443, keepalive=MQ_KEEPALIVE_SEC)
+        c.loop_start()                               # retries on its own if the VPS is down
+        threading.Thread(target=mq_heartbeat_loop, args=(c,), daemon=True).start()
+    except Exception as e:
+        print("mq: start failed (Beebotte path unaffected): " + str(e), file=sys.stderr)
+
+
 def main():
+    start_mq()
     read_autopilot()
     threading.Thread(target=autopilot_loop, daemon=True).start()
     threading.Thread(target=defer_loop, daemon=True).start()
