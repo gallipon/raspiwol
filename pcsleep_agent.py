@@ -117,17 +117,21 @@ IDLE_MIN    = 60    # required minutes with no keyboard/mouse input
 CHECK_SEC   = 60    # how often the auto-sleep loop evaluates
 COOLDOWN_SEC = 300  # grace after an auto-sleep/resume before considering again
 
-# Claude Code activity detection.  Every session appends to its own transcript
-# under ~/.claude/projects/, so the newest mtime across all of them is an
-# all-sessions OR that needs no coordination: unlike a shared busy flag, one
-# session finishing cannot clear another session's hold.  The ** is required --
-# subagent transcripts sit one level deeper, and those long unattended runs are
-# exactly what this is meant to protect.
-CC_GLOB         = os.path.expanduser("~/.claude/projects/**/*.jsonl")
-CC_STALE_MIN    = 20    # a transcript touched within this window == working.
-                        # Generous on purpose: this is only ever evaluated after
-                        # IDLE_MIN minutes of no physical input, so a fresh
-                        # transcript then means "nobody here, but still running".
+# Claude Code activity detection.  ClaudeTabs' state-hook.js keeps one file per
+# session, rewritten from Claude Code's hooks: UserPromptSubmit -> "working",
+# Stop -> "done", a permission prompt -> "blocked", StopFailure -> "failed",
+# SessionEnd -> file removed.  Any "working" file means a turn is in progress,
+# however long it has gone without writing to its transcript.  One file per
+# session also makes it an all-sessions OR: one session finishing cannot clear
+# another's hold.  "blocked" does not hold -- it is waiting for a human.
+#
+# Transcript mtimes are NOT used: every resumed claude.exe re-stamps its own
+# transcript's mtime once an hour without writing, so with ~10 tabs restored
+# after a reboot some file was always "fresh" and the PC never slept (2026-10-14).
+CC_STATE_DIR    = os.path.expanduser("~/claude_logs/claude-park/state")
+CC_PROJECTS     = os.path.expanduser("~/.claude/projects")
+CC_TAIL_BYTES   = 256 * 1024   # how much of a transcript's end is read to spot
+                               # an Esc interrupt (see _cc_interrupted)
 CC_MAX_HOLD_MIN = 180   # stop holding after this long, so a tab left looping
                         # forever cannot keep the PC awake indefinitely
 
@@ -189,50 +193,106 @@ def idle_seconds():
     return ((tick - lii.dwTime) & 0xFFFFFFFF) / 1000.0     # mask handles wrap
 
 
-def cc_active():
-    """True while any Claude Code session has been working recently.
+def _boot_epoch():
+    """Wall-clock time of the last boot (GetTickCount64 = ms since boot)."""
+    f = ctypes.windll.kernel32.GetTickCount64
+    f.restype = ctypes.c_ulonglong
+    return time.time() - f() / 1000.0
 
-    Freshness alone decides.  Nothing is written or deleted here, so a session
-    that crashes cannot leave a flag stuck on: its transcript simply stops
-    growing and goes stale within CC_STALE_MIN.  CC_MAX_HOLD_MIN covers the
-    opposite failure -- a tab looping forever that would never let the PC sleep.
+
+def _cc_interrupted(sid):
+    """True if the session's newest conversation line is an Esc interrupt.
+
+    Claude Code does not fire the Stop hook when the user interrupts a turn, so
+    the state file stays "working" although nothing runs.  The interrupt shows
+    up in the transcript as a user line "[Request interrupted by user...]".  A
+    missing transcript returns False (trust the hook).
+    """
+    paths = glob.glob(os.path.join(glob.escape(CC_PROJECTS), "*", sid + ".jsonl"))
+    if not paths:
+        return False
+    try:
+        size = os.path.getsize(paths[0])
+        with open(paths[0], "rb") as fh:
+            fh.seek(max(0, size - CC_TAIL_BYTES))
+            lines = fh.read().split(b"\n")
+    except OSError:
+        return False
+    if size > CC_TAIL_BYTES:
+        lines = lines[1:]        # first line is cut mid-way
+    for raw in reversed(lines):
+        if b'"type":"user"' not in raw and b'"type":"assistant"' not in raw:
+            continue             # system lines (away recap etc.) say nothing
+        try:
+            rec = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        if rec.get("type") not in ("user", "assistant") or rec.get("isSidechain"):
+            continue
+        if rec["type"] == "assistant":
+            return False
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+        else:
+            text = ""
+        return text.lstrip().startswith("[Request interrupted by user")
+    return False
+
+
+def _cc_working_session():
+    """Session id of a turn in progress, "" if none (see CC_STATE_DIR)."""
+    try:
+        names = os.listdir(CC_STATE_DIR)
+    except OSError:
+        # ClaudeTabs' hook is not installed: do not hold.  Holding on a guess is
+        # what kept the PC awake all night, so a missing signal means "idle".
+        return ""
+    boot = _boot_epoch()
+    for name in names:
+        if not name.endswith(".json"):
+            continue             # *.tmp is mid-rename
+        try:
+            with open(os.path.join(CC_STATE_DIR, name), encoding="utf-8") as fh:
+                st = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if st.get("state") != "working":
+            continue
+        if st.get("ts", 0) / 1000.0 < boot:
+            continue             # left over from before a reboot or crash
+        sid = name[:-5]
+        if _cc_interrupted(sid):
+            continue
+        return sid
+    return ""
+
+
+def cc_active():
+    """True while any Claude Code session has a turn in progress.
+
+    Nothing is written or deleted here.  A session that dies mid-turn leaves its
+    state file on "working"; a reboot clears that (ts older than boot), and
+    CC_MAX_HOLD_MIN covers both that and a tab looping forever that would never
+    let the PC sleep.
 
     Callers should evaluate this LAST, after the idle/weekday/cutoff checks, so
     the directory scan only runs when a suspend is otherwise imminent.
     """
     global _cc_hold_since, _cc_hold_capped
-    try:
-        files = glob.glob(CC_GLOB, recursive=True)
-    except OSError as e:
-        print("cc_active: scan failed: " + str(e), file=sys.stderr)
-        return False
-    if not files:
-        # Claude Code moved its transcripts, or is not installed for this user.
-        print("cc_active: no transcripts under " + CC_GLOB +
-              " -- detection is not working", file=sys.stderr)
-        return False
-
-    newest      = 0.0
-    newest_file = ""
-    for f in files:
-        try:
-            m = os.path.getmtime(f)
-        except OSError:
-            continue        # a session removed or rotated it mid-scan
-        if m > newest:
-            newest, newest_file = m, f
-
+    sid = _cc_working_session()
     now = time.time()
-    if now - newest > CC_STALE_MIN * 60:
+    if not sid:
         _cc_hold_since  = 0.0
         _cc_hold_capped = False
         return False
 
     if not _cc_hold_since:
         _cc_hold_since = now
-        # Name the project so an unexpected "it never slept" is traceable.
-        print("cc_active: %s active -- holding off sleep"
-              % os.path.basename(os.path.dirname(newest_file)))
+        # Name the session so an unexpected "it never slept" is traceable.
+        print("cc_active: session %s working -- holding off sleep" % sid)
 
     if now - _cc_hold_since >= CC_MAX_HOLD_MIN * 60:
         if not _cc_hold_capped:
