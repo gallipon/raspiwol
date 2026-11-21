@@ -61,6 +61,7 @@ import ctypes
 import datetime
 import glob
 import json
+import math
 import os
 import ssl
 import sys
@@ -164,14 +165,17 @@ autopilot_on = True   # cached switch state; default on (automation enabled)
 auto_from_mq = False
 
 # Self-hosted broker command guard, separate from cmd_watermark: its ts comes
-# from the sender's clock, not Beebotte's.  Until mq_seeded, a RETAINED
-# pcsleep_req (the copy the broker hands over on subscribe) is history, exactly
-# like the REST queue's backlog at start-up.  mq_seeded turns True on the first
-# live message or MQ_SEED_SEC after the first connect, so a command retained
-# while a later reconnect was pending is still executed.
-mq_watermark = 0.0
-mq_seeded    = False
-MQ_SEED_SEC  = 10
+# from the sender's clock, not Beebotte's.  Seeded with this process's start
+# time, so anything sent before we started is history (the REST queue's backlog
+# rule) no matter when or how often the broker hands the retained copy over,
+# while a command sent during a later disconnect is still executed on reconnect.
+mq_watermark = time.time() * 1000.0
+MQ_FUTURE_SEC = 600    # a ts further ahead than this is rejected: it would block
+                       # every later command until the clock caught up
+
+# Guards autopilot_on / auto_from_mq: a Beebotte REST read can take seconds and
+# must not overwrite a value the self-hosted broker delivered meanwhile.
+auto_lock = threading.Lock()
 
 # Highest command timestamp (ms, Beebotte's own) already handled.  0 = not yet
 # initialised; poll_loop seeds it from the queue so the backlog is skipped.
@@ -362,12 +366,19 @@ def read_autopilot():
         return             # the self-hosted broker owns the switch now
     try:
         arr = bbt_read(AUTO_RESOURCE, 1)
-        if arr:
-            autopilot_on = str(arr[0].get("data", "off")).strip().lower() == "on"
-        print("autopilot initial state: " + ("on" if autopilot_on else "off"))
+        new = (str(arr[0].get("data", "off")).strip().lower() == "on") if arr else None
+        err = None
     except Exception as e:
-        autopilot_on = False   # fail safe: never auto-sleep on a read failure
-        print("autopilot read failed (fail-safe off): " + str(e), file=sys.stderr)
+        new, err = False, e    # fail safe: never auto-sleep on a read failure
+    with auto_lock:
+        if auto_from_mq:
+            return         # the broker spoke while we were reading -- it wins
+        if new is not None:
+            autopilot_on = new
+    if err is not None:
+        print("autopilot read failed (fail-safe off): " + str(err), file=sys.stderr)
+    else:
+        print("autopilot initial state: " + ("on" if autopilot_on else "off"))
 
 
 def autopilot_loop():
@@ -595,9 +606,10 @@ def on_message(client, userdata, msg):
         return
 
     if msg.topic == AUTO_TOPIC:
-        if auto_from_mq:
-            return         # the self-hosted broker owns the switch now
-        autopilot_on = (val == "on")
+        with auto_lock:
+            if auto_from_mq:
+                return     # the self-hosted broker owns the switch now
+            autopilot_on = (val == "on")
         print("autopilot -> " + ("on" if autopilot_on else "off"))
         return
 
@@ -691,19 +703,15 @@ MQ_AUTO_TOPIC = AUTO_TOPIC
 MQ_AGENT_TOPIC = AGENT_TOPIC
 
 
-def _mq_mark_seeded():
-    global mq_seeded
-    mq_seeded = True
-
-
 def mq_on_connect(client, userdata, flags, reason_code, properties):
-    if reason_code.is_failure:
-        print("mq: connect refused (%s)" % reason_code, file=sys.stderr)
-        return
-    client.subscribe([(MQ_REQ_TOPIC, 1), (MQ_AUTO_TOPIC, 1)])
-    print("mq: connected to %s; subscribed %s, %s" % (MQ_HOST, MQ_REQ_TOPIC, MQ_AUTO_TOPIC))
-    if not mq_seeded:
-        threading.Timer(MQ_SEED_SEC, _mq_mark_seeded).start()
+    try:
+        if reason_code.is_failure:
+            print("mq: connect refused (%s)" % reason_code, file=sys.stderr)
+            return
+        client.subscribe([(MQ_REQ_TOPIC, 1), (MQ_AUTO_TOPIC, 1)])
+        print("mq: connected to %s; subscribed %s, %s" % (MQ_HOST, MQ_REQ_TOPIC, MQ_AUTO_TOPIC))
+    except Exception as e:
+        print("mq: on_connect error: " + str(e), file=sys.stderr)
 
 
 def mq_on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
@@ -711,7 +719,7 @@ def mq_on_disconnect(client, userdata, disconnect_flags, reason_code, properties
 
 
 def mq_on_message(client, userdata, msg):
-    global autopilot_on, auto_from_mq, mq_watermark, mq_seeded
+    global autopilot_on, auto_from_mq, mq_watermark
     try:
         if not msg.payload:
             return                                   # retained copy deleted
@@ -719,33 +727,36 @@ def mq_on_message(client, userdata, msg):
         val  = str(body.get("data", "")).strip().lower()
 
         if msg.topic == MQ_AUTO_TOPIC:
-            autopilot_on = (val == "on")
-            if not auto_from_mq:
+            with auto_lock:
+                autopilot_on = (val == "on")
+                took_over = not auto_from_mq
+                auto_from_mq = True
+            if took_over:
                 print("mq: taking over the autopilot switch from Beebotte")
-            auto_from_mq = True
             print("autopilot -> %s (mq)" % ("on" if autopilot_on else "off"))
             return
 
         if msg.topic != MQ_REQ_TOPIC:
             return
         ts = float(body.get("ts", 0))
-        if msg.retain and not mq_seeded:
-            mq_watermark = max(mq_watermark, ts)     # start-up backlog: history
-            mq_seeded = True
-            print("mq: command queue ready (watermark %.0f)" % mq_watermark)
+        if not math.isfinite(ts) or ts > (time.time() + MQ_FUTURE_SEC) * 1000.0:
+            print("mq: command with bad ts ignored: %r %s" % (body.get("ts"), val),
+                  file=sys.stderr)
             return
-        mq_seeded = True
         if ts <= mq_watermark:
-            return                                   # already handled (redelivery)
-        mq_watermark = ts                            # advance BEFORE acting, see poll_loop
+            return                     # sent before we started, or already handled
+        mq_watermark = ts              # advance BEFORE acting, see poll_loop
         age = time.time() - ts / 1000.0
         if age > CMD_MAX_AGE_SEC:
             print("mq: stale command ignored (%d min old): %s" % (age / 60, val))
             return
         print("command via mq: " + val)
-        # handle_command may block in SetSuspendState; run it off paho's thread
-        # so the connection keeps being serviced across the suspend.
-        threading.Thread(target=handle_command, args=(val,), daemon=True).start()
+        if val == "sleep":
+            # SetSuspendState blocks until resume; keep paho's thread free so the
+            # connection is serviced across the suspend.
+            threading.Thread(target=handle_command, args=(val,), daemon=True).start()
+        else:
+            handle_command(val)        # sleep_in / cancel: quick, keep arrival order
     except Exception as e:
         print("mq: message error: " + str(e), file=sys.stderr)
 

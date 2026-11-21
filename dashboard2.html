@@ -237,9 +237,12 @@ function renderPower() {
   var shown = v === "up" ? "ON" : v === "down" ? "OFF" : String(v);
   if (lastPower.live && Date.now() - lastPower.rxAt < POWER_STALE_MS) {
     setStatus(v === "up" ? "up" : "down", shown);
+    // 「更新を待っています」「応答なし」の説明を消す。切断中は接続側の表示を残す
+    if (client.connected) conn.textContent = "接続OK";
     return;
   }
   setStatus("wait", "不明");
+  if (!client.connected) return;   // 切断・認証失敗の説明は上書きしない
   if (lastPower.live) {
     conn.textContent = "Pi から応答なし / 前回値 " + shown + "（" + fmtAge(Date.now() - lastPower.rxAt) + "）";
   } else {

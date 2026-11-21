@@ -56,12 +56,18 @@ WAKE_TARGET = cfg.get("wake", "target", fallback="officepc")  # 朝Wake の対�
 # 自前ブローカー（VPS の Mosquitto、wss://<host>/mqtt）。Beebotte の証明書が 2026-11-17 に切れたまま
 # 更新されないため、並行運用しながら移行する。raspiwol.ini に [mqtt2] が無ければ無効で、従来どおり動く。
 # この経路の失敗が Beebotte 側に波及しないこと（Pi は壊れると現地対応になる）。
-MQ2_HOST     = cfg.get("mqtt2", "host",     fallback="")
-MQ2_PATH     = cfg.get("mqtt2", "path",     fallback="/mqtt")
-MQ2_USER     = cfg.get("mqtt2", "user",     fallback="pi")
-MQ2_PASS     = cfg.get("mqtt2", "password", fallback="")
+# 設定の読み損ね（"%" を含む値の補間エラー等）で起動不能にならないよう、raw で読み、失敗したら新経路だけ無効にする。
+try:
+    MQ2_HOST = cfg.get("mqtt2", "host",     fallback="", raw=True).strip()
+    MQ2_PATH = cfg.get("mqtt2", "path",     fallback="/mqtt", raw=True).strip()
+    MQ2_USER = cfg.get("mqtt2", "user",     fallback="pi", raw=True).strip()
+    MQ2_PASS = cfg.get("mqtt2", "password", fallback="", raw=True).strip()
+    POWER_IP = cfg.get("mqtt2", "power_ip",
+                       fallback=cfg.get("nightwatch", "target_ip", fallback="", raw=True), raw=True).strip()
+except Exception as _e:
+    print(f"WARNING: [mqtt2] unreadable, self-hosted broker disabled: {_e}", file=sys.stderr)
+    MQ2_HOST = MQ2_PATH = MQ2_USER = MQ2_PASS = POWER_IP = ""
 MQ2_ENABLED  = bool(MQ2_HOST and MQ2_PASS)
-POWER_IP     = cfg.get("mqtt2", "power_ip", fallback=cfg.get("nightwatch", "target_ip", fallback=""))
 POWER_SEC      = 30    # 電源状態を置く間隔
 POWER_FAST_SEC = 3     # WOL を受けた直後はこの間隔に縮める（Wake の反映を速く見せる）
 POWER_FAST_FOR = 120   # 縮める時間
@@ -295,16 +301,23 @@ def mq2_read_retained(topic: str, timeout: float = 5.0):
                 got.append(m.payload.decode(errors="replace"))
         done.set()
 
-    try:
-        c = _mq2_client(f"raspiwol-oneshot-{int(time.time())}")
-        c.on_connect, c.on_message = on_connect, on_message
-        c.connect(MQ2_HOST, 443, keepalive=30)
-        c.loop_start()
-        done.wait(timeout)
-        c.disconnect()
-        c.loop_stop()
-    except Exception as e:
-        print(f"mq2_read_retained error: {e}", file=sys.stderr)
+    def worker():
+        try:
+            c = _mq2_client(f"raspiwol-oneshot-{int(time.time())}")
+            c.on_connect, c.on_message = on_connect, on_message
+            c.connect(MQ2_HOST, 443, keepalive=30)   # DNS・TCP・TLS もこのスレッドの中で待つ
+            c.loop_start()
+            done.wait(timeout)
+            c.disconnect()
+            c.loop_stop()
+        except Exception as e:
+            print(f"mq2_read_retained error: {e}", file=sys.stderr)
+        done.set()
+
+    # 接続から切断までの全体に期限をかける。過ぎたらスレッドを待たずに Beebotte へフォールバックする。
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout + 3)
     return got[0] if got else None
 
 
@@ -568,26 +581,40 @@ def handle(data: str):
         if not UPDATE_URL:
             pub("update_url not set in raspiwol.ini")
             return
-        pub("update: downloading")
-        tmp = SCRIPT_DEST.with_suffix(".tmp")
+        # 新旧どちらのブローカーからも来うるので、書き込み・rename・再マウントを重ねない
+        if not _update_lock.acquire(blocking=False):
+            pub("update: already running")
+            return
         try:
-            remount_boot(rw=True)
-            req = urllib.request.Request(UPDATE_URL)
-            if UPDATE_GITHUB_TOKEN:
-                req.add_header("Authorization", f"token {UPDATE_GITHUB_TOKEN}")
-            with urllib.request.urlopen(req) as resp:
-                tmp.write_bytes(resp.read())
-            tmp.rename(SCRIPT_DEST)
-            remount_boot(rw=False)
-            pub("update: saved, restarting service")
-            subprocess.Popen(["systemctl", "restart", "raspiwol"])
-        except Exception as e:
-            pub(f"update_fail: {e}")
-            tmp.unlink(missing_ok=True)
-            remount_boot(rw=False)
+            _do_update()
+        finally:
+            _update_lock.release()
         return
 
     pub(f"unknown_command: {cmd}")
+
+
+_update_lock = threading.Lock()
+
+
+def _do_update():
+    pub("update: downloading")
+    tmp = SCRIPT_DEST.with_suffix(".tmp")
+    try:
+        remount_boot(rw=True)
+        req = urllib.request.Request(UPDATE_URL)
+        if UPDATE_GITHUB_TOKEN:
+            req.add_header("Authorization", f"token {UPDATE_GITHUB_TOKEN}")
+        with urllib.request.urlopen(req) as resp:
+            tmp.write_bytes(resp.read())
+        tmp.rename(SCRIPT_DEST)
+        remount_boot(rw=False)
+        pub("update: saved, restarting service")
+        subprocess.Popen(["systemctl", "restart", "raspiwol"])
+    except Exception as e:
+        pub(f"update_fail: {e}")
+        tmp.unlink(missing_ok=True)
+        remount_boot(rw=False)
 
 
 def on_connect(client, userdata, connect_flags, reason_code, properties):
