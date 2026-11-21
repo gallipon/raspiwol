@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>officepc リモコン</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 24px;
+    font-family: system-ui, -apple-system, "Hiragino Kaku Gothic ProN", sans-serif;
+    background: #15171c; color: #e8eaed; padding: 24px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0; color: #9aa0a6; }
+  .status { display: flex; align-items: center; gap: 12px; font-size: 22px; font-weight: 600; }
+  .dot {
+    width: 18px; height: 18px; border-radius: 50%; background: #5f6368;
+    transition: background .3s, box-shadow .3s;
+  }
+  .dot.up   { background: #34a853; box-shadow: 0 0 12px 2px rgba(52,168,83,.6); }
+  .dot.down { background: #ea4335; }
+  .dot.wait { background: #fbbc04; }
+  .buttons { display: flex; gap: 16px; }
+  button {
+    appearance: none; border: none; border-radius: 16px;
+    padding: 22px 28px; min-width: 130px;
+    font-size: 18px; font-weight: 700; color: #fff;
+    cursor: pointer; transition: transform .05s, opacity .2s;
+  }
+  button:active { transform: scale(.96); }
+  button:disabled { opacity: .4; cursor: default; }
+  .wake  { background: #1a73e8; }
+  .sleep { background: #5f6368; }
+  .leave { background: #7b5800; min-width: 280px; padding: 16px 22px; font-size: 16px; }
+  .deferrow { display: none; align-items: center; gap: 12px; font-size: 13px; color: #e8eaed; }
+  .deferrow.visible { display: flex; }
+  .cancelbtn { padding: 8px 14px; min-width: 0; border-radius: 12px; font-size: 13px; background: #5f6368; }
+  .meta { font-size: 12px; color: #80868b; text-align: center; line-height: 1.6; }
+  .autorow { display: flex; align-items: center; gap: 12px; font-size: 14px; color: #9aa0a6; }
+  .autobtn { padding: 10px 18px; min-width: 88px; border-radius: 14px; font-size: 15px; font-weight: 700; }
+  .autobtn.on  { background: #34a853; }
+  .autobtn.off { background: #5f6368; }
+  .agent-row { font-size: 12px; color: #80868b; text-align: center; }
+  .gpio-section { display: none; flex-direction: column; align-items: center; gap: 8px; }
+  .gpio-section.visible { display: flex; }
+  .gpio-warn { font-size: 11px; color: #ea4335; text-align: center; max-width: 300px; line-height: 1.5; }
+  .gpio-btn {
+    background: #b71c1c; padding: 14px 22px; min-width: 200px;
+    border-radius: 14px; font-size: 14px; font-weight: 700; color: #fff;
+    border: none; cursor: pointer; transition: transform .05s, opacity .2s;
+  }
+  .gpio-btn:active { transform: scale(.96); }
+  .gpio-btn:disabled { opacity: .4; cursor: default; }
+  #log {
+    width: 100%; max-width: 380px; height: 96px; overflow-y: auto;
+    background: #0e1014; border-radius: 10px; padding: 10px 12px;
+    font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; color: #9aa0a6;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+  <h1>officepc リモコン</h1>
+
+  <div class="status">
+    <span id="dot" class="dot wait"></span>
+    <span id="label">接続中…</span>
+  </div>
+
+  <div class="buttons">
+    <button id="wake"  class="wake">Wake</button>
+    <button id="sleep" class="sleep">Sleep</button>
+  </div>
+
+  <button id="leave" class="leave">退勤（10分後スリープ）</button>
+
+  <div id="defer-row" class="deferrow">
+    <span id="defer-text"></span>
+    <button id="defer-cancel" class="cancelbtn">取消</button>
+  </div>
+
+  <div class="autorow">
+    <span>自動 Wake/Sleep</span>
+    <button id="auto" class="autobtn off">--</button>
+  </div>
+
+  <div class="meta">
+    <span id="conn"></span><br>
+    target <span id="ip"></span>
+  </div>
+
+  <div class="agent-row">
+    PC エージェント: <span id="agent-status">確認中…</span>
+  </div>
+
+  <div id="gpio-section" class="gpio-section">
+    <div class="gpio-warn">
+      ⚠️ エージェントが応答していません。GPIO 電源ボタンでのスリープは<br>
+      約 60% の成功率で、寝ても起き返すことがあります。
+    </div>
+    <button id="gpio-btn" class="gpio-btn">GPIO で寝かせる（最終手段・不確実）</button>
+  </div>
+
+  <div id="log"></div>
+
+<!-- mqtt.js はページと同じ場所に置いて配る（CDN に依存しない） -->
+<script src="mqtt.min.js"></script>
+<script>
+// 自前ブローカー版（2026-11-21）。Beebotte 版の dashboard.html と見た目・操作は同じ。
+// ブローカー: VPS の Mosquitto（wss://<このページのホスト>/mqtt、Apache 経由）。
+//
+// Beebotte の read/write は MQTT の retained に置き換えた:
+//   raspi3b/wol         コマンド。retained にしない（遅れて実行させない）
+//   raspi3b/power       Pi が30秒ごとに ping して retained で置く。ページからの ping 要求は不要
+//   raspi3b/agent       PC エージェントの heartbeat（epoch 秒）。retained
+//   raspi3b/autopilot   自動 Wake/Sleep のスイッチ。retained
+//   raspi3b/pcsleep_req スリープ指示。retained・QoS1。本文の ts でエージェントが古い指示を捨てる
+//   raspi3b/log         Pi のログ
+
+// ── 設定 ───────────────────────────────────────────────────────────────────
+var BROKER_URL = "wss://" + location.host + "/mqtt";
+var MQTT_USER  = "dashboard";
+var CHANNEL    = "raspi3b";
+var TARGET_IP  = "192.168.1.50"; // 対象 PC の固定 IP（表示用。ping は Pi が自分で打つ。デプロイ時に実IPへ）
+var WAKE_CMD   = "officepc";     // WOL の宛先名（raspi3b/wol へ。デプロイ時に実名へ）
+var SLEEP_CMD  = "sleep";        // PC エージェントが解釈するスリープ指示（SetSuspendState）
+var DEFER_MIN  = 10;             // 退勤ボタンの遅延（分）
+var DEFER_IDLE_MIN = 5;          // 遅延経過後に必要なアイドル分数（エージェント側と揃える・表示用）
+var AGENT_STALE_MS = 150000;     // heartbeat がこれより古ければ agent down
+var POWER_STALE_MS = 75000;      // Pi の power が届かなくなってこれだけ経てば「不明」（30秒周期の2.5回分）
+
+// パスワードは URL ハッシュで渡す:  dashboard2.html#<dashboard ユーザーのパスワード>
+// フラグメントはサーバへ送られないので、アクセスログにも残らない。
+var PASSWORD = decodeURIComponent((location.hash || "").replace(/^#/, "").trim());
+
+function topic(res) { return CHANNEL + "/" + res; }
+
+// ── DOM ────────────────────────────────────────────────────────────────────
+var dot         = document.getElementById("dot");
+var label       = document.getElementById("label");
+var conn        = document.getElementById("conn");
+var wakeB       = document.getElementById("wake");
+var sleepB      = document.getElementById("sleep");
+var leaveB      = document.getElementById("leave");
+var autoB       = document.getElementById("auto");
+var agentStatus = document.getElementById("agent-status");
+var gpioSection = document.getElementById("gpio-section");
+var gpioBtn     = document.getElementById("gpio-btn");
+document.getElementById("ip").textContent = TARGET_IP;
+
+function logLine(s) {
+  var el = document.getElementById("log");
+  el.textContent += "[" + new Date().toLocaleTimeString() + "] " + s + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+function setStatus(state, text) { dot.className = "dot " + state; label.textContent = text; }
+function setButtons(enabled) {
+  wakeB.disabled = sleepB.disabled = leaveB.disabled = autoB.disabled = gpioBtn.disabled = !enabled;
+}
+
+if (!PASSWORD) {
+  setStatus("down", "パスワード未設定");
+  conn.textContent = "URL の末尾に #<パスワード> を付けて開いてください";
+  setButtons(false);
+  throw new Error("no password");
+}
+if (typeof mqtt === "undefined") {
+  setStatus("down", "読み込み失敗");
+  conn.textContent = "mqtt.min.js を読み込めませんでした";
+  setButtons(false);
+  throw new Error("mqtt.js missing");
+}
+
+function fmtAge(ms) {
+  var s = Math.round(ms / 1000);
+  if (s < 90) return s + "秒前";
+  if (s < 5400) return Math.round(s / 60) + "分前";
+  return Math.round(s / 3600) + "時間前";
+}
+
+// ── 接続 ───────────────────────────────────────────────────────────────────
+setButtons(false);
+var client = mqtt.connect(BROKER_URL, {
+  username: MQTT_USER, password: PASSWORD,
+  clientId: "dash-" + Math.random().toString(16).slice(2, 10),
+  keepalive: 60, reconnectPeriod: 3000, connectTimeout: 10000, clean: true
+});
+
+client.on("connect", function () {
+  conn.textContent = "接続OK";
+  setButtons(true);
+  client.subscribe([topic("power"), topic("agent"), topic("autopilot"), topic("log")], { qos: 0 });
+});
+client.on("reconnect", function () { conn.textContent = "再接続中…"; });
+client.on("offline",   function () { conn.textContent = "切断中（再接続を待っています）"; setButtons(false); });
+client.on("error", function (e) {
+  logLine("接続エラー: " + e.message);
+  // 認証失敗は再試行しても直らないので止める
+  if (/Not authorized|Bad username or password/i.test(e.message)) {
+    client.end(true);
+    setStatus("down", "認証失敗");
+    conn.textContent = "パスワードを確認してください";
+  }
+});
+
+function parse(buf) {
+  var s = buf.toString();
+  try { var j = JSON.parse(s); return (j && typeof j === "object") ? j : { data: j }; }
+  catch (e) { return { data: s }; }
+}
+
+function send(res, value, opts) {
+  opts = opts || { qos: 0, retain: false };
+  var body = JSON.stringify(value);
+  logLine("→ " + res + ": " + (value.data !== undefined ? value.data : body));
+  client.publish(topic(res), body, opts, function (err) {
+    if (err) logLine("送信失敗 " + res + ": " + err.message);
+  });
+}
+function publishCmd(cmd) { send("wol", { data: cmd }); }
+// スリープ系は retained・QoS1。エージェントが切断中でも、つなぎ直したときに受け取れる。
+// ts はエージェントの「同じ指示は一度だけ」「5分より古い指示は捨てる」の判定に使う。
+function sendCmd(cmd) { send("pcsleep_req", { data: cmd, ts: Date.now() }, { qos: 1, retain: true }); }
+
+// ── 電源ステータス ─────────────────────────────────────────────────────────
+// 鮮度は「このページが受け取った時刻」で判定する。Pi は RTC が無く、再起動の直後は
+// 本文の ts が過去にずれるため、ts は表示にだけ使う。
+// retained で届いた値（接続直後）はいつのものか分からないので「前回値」として扱い、
+// 接続中に届いた値（retain=false）だけを現状として ON/OFF に出す。
+var lastPower = null;      // { v, rxAt, live }
+function renderPower() {
+  if (!lastPower) return;
+  var v = lastPower.v;
+  var shown = v === "up" ? "ON" : v === "down" ? "OFF" : String(v);
+  if (lastPower.live && Date.now() - lastPower.rxAt < POWER_STALE_MS) {
+    setStatus(v === "up" ? "up" : "down", shown);
+    return;
+  }
+  setStatus("wait", "不明");
+  if (lastPower.live) {
+    conn.textContent = "Pi から応答なし / 前回値 " + shown + "（" + fmtAge(Date.now() - lastPower.rxAt) + "）";
+  } else {
+    conn.textContent = "Pi の更新を待っています / 前回値 " + shown;
+  }
+}
+setInterval(renderPower, 5000);
+
+// ── Agent 生存確認 ─────────────────────────────────────────────────────────
+// data は PC エージェントが入れた epoch 秒（PC は RTC があるので本文の時刻を使ってよい）。
+function renderAgent(epochSec) {
+  if (!epochSec) { agentStatus.textContent = "⚫ 不明"; gpioSection.classList.remove("visible"); return; }
+  var staleMs = Date.now() - epochSec * 1000;
+  if (staleMs < AGENT_STALE_MS) {
+    agentStatus.textContent = "🟢 alive（" + Math.round(staleMs / 1000) + "秒前）";
+    gpioSection.classList.remove("visible");
+  } else {
+    agentStatus.textContent = "⚫ down（" + fmtAge(staleMs) + "が最後）";
+    gpioSection.classList.add("visible");
+  }
+}
+var lastAgent = 0;
+setInterval(function () { if (lastAgent) renderAgent(lastAgent); }, 5000);
+
+// ── 受信 ───────────────────────────────────────────────────────────────────
+client.on("message", function (t, payload, packet) {
+  if (!payload.length) return;                 // 空の retained = 削除済み
+  var m = parse(payload);
+  if (t === topic("power")) {
+    var first = !lastPower;
+    lastPower = { v: m.data, rxAt: Date.now(), live: !packet.retain };
+    if (first || !packet.retain) logLine("power = " + m.data + (packet.retain ? "（前回値）" : ""));
+    renderPower();
+  } else if (t === topic("agent")) {
+    lastAgent = Number(m.data) || 0;
+    renderAgent(lastAgent);
+  } else if (t === topic("autopilot")) {
+    setAuto(String(m.data).toLowerCase() === "on");
+  } else if (t === topic("log")) {
+    if (!packet.retain) logLine("Pi: " + m.data);
+  }
+});
+
+// ── ボタン ──────────────────────────────────────────────────────────────────
+wakeB.addEventListener("click", function () {
+  publishCmd(WAKE_CMD);          // Pi は wol を受けると2分間 ping を速める
+  setStatus("wait", "起動中…");
+});
+
+sleepB.addEventListener("click", function () {
+  if (!confirm("officepc をスリープさせますか？")) return;
+  sendCmd(SLEEP_CMD);
+  try { localStorage.removeItem("defer_due"); } catch (e) {}
+  setStatus("wait", "スリープ中…");
+});
+
+// ── 退勤ボタン（遅延スリープ予約）────────────────────────────────────────────
+// 表示は端末ローカル（localStorage）で、真実はエージェント側にある。
+var deferRow    = document.getElementById("defer-row");
+var deferText   = document.getElementById("defer-text");
+var deferCancel = document.getElementById("defer-cancel");
+
+function deferDue() {
+  var v = 0;
+  try { v = Number(localStorage.getItem("defer_due") || 0); } catch (e) {}
+  return (v && Date.now() < v + 4 * 3600 * 1000) ? v : 0;
+}
+function renderDefer() {
+  var due = deferDue();
+  if (!due) { deferRow.classList.remove("visible"); return; }
+  deferRow.classList.add("visible");
+  var left = Math.round((due - Date.now()) / 1000);
+  if (left > 0) {
+    var mm = Math.floor(left / 60), ss = left % 60;
+    deferText.textContent = "💤 予約中 残り " + mm + ":" + (ss < 10 ? "0" : "") + ss;
+  } else {
+    deferText.textContent = "💤 予約中 アイドル" + DEFER_IDLE_MIN + "分で実行";
+  }
+}
+leaveB.addEventListener("click", function () {
+  sendCmd("sleep_in " + DEFER_MIN);
+  try { localStorage.setItem("defer_due", String(Date.now() + DEFER_MIN * 60000)); } catch (e) {}
+  logLine("退勤予約: " + DEFER_MIN + "分後 + アイドル" + DEFER_IDLE_MIN + "分");
+  renderDefer();
+});
+deferCancel.addEventListener("click", function () {
+  sendCmd("cancel");
+  try { localStorage.removeItem("defer_due"); } catch (e) {}
+  logLine("退勤予約を取消");
+  renderDefer();
+});
+renderDefer();
+setInterval(renderDefer, 1000);
+
+// ── GPIO 最終手段ボタン ──────────────────────────────────────────────────────
+gpioBtn.addEventListener("click", function () {
+  if (!confirm("Agent が応答していません。GPIO 電源ボタンでのスリープは約 60% の成功率で、"
+      + "寝ても起き返すことがあります。実行しますか？")) return;
+  publishCmd("pwrbtn");
+  logLine("GPIO 電源ボタン送信（最終手段）");
+});
+
+// ── 自動 Wake/Sleep スイッチ（autopilot）──────────────────────────────────────
+// retained で置くので、購読しているページ・Pi・エージェントすべてに即時に届く。
+// Beebotte 版にあった「read が追いつくまでローカル値を優先」の小細工は不要になった。
+var autoOn = true;
+function setAuto(on) {
+  autoOn = on;
+  autoB.className = "autobtn " + (on ? "on" : "off");
+  autoB.textContent = on ? "ON" : "OFF";
+}
+autoB.addEventListener("click", function () {
+  var next = !autoOn;
+  setAuto(next);
+  send("autopilot", { data: next ? "on" : "off", ts: Date.now() }, { qos: 1, retain: true });
+});
+</script>
+</body>
+</html>
