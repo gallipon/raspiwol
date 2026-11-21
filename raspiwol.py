@@ -71,6 +71,8 @@ MQ2_ENABLED  = bool(MQ2_HOST and MQ2_PASS)
 POWER_SEC      = 30    # 電源状態を置く間隔
 POWER_FAST_SEC = 3     # WOL を受けた直後はこの間隔に縮める（Wake の反映を速く見せる）
 POWER_FAST_FOR = 120   # 縮める時間
+SLEEP_REQ_TOPIC = (TOPIC_CMD.split("/")[0] if "/" in TOPIC_CMD else "raspi3b") + "/pcsleep_req"
+                       # PC への Sleep 指示。Pi は見るだけ（確認を速める合図）
 
 # name (lowercase) → mac
 devices: dict[str, str] = {}
@@ -660,8 +662,8 @@ def mq2_on_connect(client, userdata, connect_flags, reason_code, properties):
         if reason_code.is_failure:
             print(f"mq2: connect refused ({reason_code})", file=sys.stderr)
             return
-        client.subscribe(TOPIC_CMD, qos=0)
-        print(f"mq2: connected to {MQ2_HOST}, subscribed {TOPIC_CMD}")
+        client.subscribe([(TOPIC_CMD, 0), (SLEEP_REQ_TOPIC, 0)])
+        print(f"mq2: connected to {MQ2_HOST}, subscribed {TOPIC_CMD}, {SLEEP_REQ_TOPIC}")
         client.publish(TOPIC_LOG, json.dumps({"data": f"connected ip={local_ip()}"}))
     except Exception as e:
         print(f"mq2 on_connect error: {e}", file=sys.stderr)
@@ -673,6 +675,13 @@ def mq2_on_disconnect(client, userdata, disconnect_flags, reason_code, propertie
 
 def mq2_on_message(client, userdata, msg):
     try:
+        # PC への Sleep 指示（エージェント宛て）。Pi は何も実行せず、寝ていく様子を早く見せるために
+        # 電源状態の確認を速めるだけ。retained は過去の指示なので見ない。sleep_in は寝るのが先なので速めない。
+        if msg.topic == SLEEP_REQ_TOPIC:
+            if not msg.retain and msg.payload:
+                if str(json.loads(msg.payload).get("data", "")).strip().lower() == "sleep":
+                    _power_speed_up()
+            return
         # コマンドは retained にしない約束。万一 retained で置かれていたら、再接続のたびに
         # reboot や pwrbtn_10s が遅れて実行されてしまうので、受け取る側でも捨てる。
         if msg.retain:
