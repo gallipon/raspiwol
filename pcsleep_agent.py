@@ -703,6 +703,13 @@ MQ_AUTO_TOPIC = AUTO_TOPIC
 MQ_AGENT_TOPIC = AGENT_TOPIC
 
 
+def _mq_suspend():
+    try:
+        sleep_pc()
+    except Exception as e:
+        print("mq: suspend failed: " + str(e), file=sys.stderr)
+
+
 def mq_on_connect(client, userdata, flags, reason_code, properties):
     try:
         if reason_code.is_failure:
@@ -752,9 +759,12 @@ def mq_on_message(client, userdata, msg):
             return
         print("command via mq: " + val)
         if val == "sleep":
-            # SetSuspendState blocks until resume; keep paho's thread free so the
-            # connection is serviced across the suspend.
-            threading.Thread(target=handle_command, args=(val,), daemon=True).start()
+            # Clear any reservation here, in arrival order; only the suspend itself
+            # (it blocks until resume) runs off paho's thread, so a sleep_in that
+            # arrives after this sleep cannot be cancelled by a late worker.
+            print("sleep command received -> suspending")
+            cancel_defer("superseded by immediate sleep")
+            threading.Thread(target=_mq_suspend, daemon=True).start()
         else:
             handle_command(val)        # sleep_in / cancel: quick, keep arrival order
     except Exception as e:

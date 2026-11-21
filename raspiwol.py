@@ -605,9 +605,15 @@ def _do_update():
         req = urllib.request.Request(UPDATE_URL)
         if UPDATE_GITHUB_TOKEN:
             req.add_header("Authorization", f"token {UPDATE_GITHUB_TOKEN}")
-        with urllib.request.urlopen(req) as resp:
-            tmp.write_bytes(resp.read())
-        tmp.rename(SCRIPT_DEST)
+        with urllib.request.urlopen(req, timeout=30) as resp:   # 止まってロックを握り続けないように
+            body = resp.read()
+        # 差し替える前に中身を確かめる。HTML のエラーページや空・壊れたファイルで再起動すると
+        # 遠隔では戻せなくなる（Pi は現地対応になる）
+        if len(body) < 1000:
+            raise ValueError(f"downloaded file too small ({len(body)} bytes)")
+        compile(body, str(SCRIPT_DEST), "exec")             # SyntaxError ならここで止まる
+        tmp.write_bytes(body)
+        tmp.replace(SCRIPT_DEST)
         remount_boot(rw=False)
         pub("update: saved, restarting service")
         subprocess.Popen(["systemctl", "restart", "raspiwol"])
