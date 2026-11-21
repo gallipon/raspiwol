@@ -53,6 +53,25 @@ POWER_RESOURCE     = "power"       # ※Beebotte チャンネルに事前に作�
 AUTOPILOT_RESOURCE = "autopilot"   # ※同上。自動Wake/Sleep のマスタ ON/OFF スイッチ
 WAKE_TARGET = cfg.get("wake", "target", fallback="officepc")  # 朝Wake の対象デバイス
 
+# 自前ブローカー（VPS の Mosquitto、wss://<host>/mqtt）。Beebotte の証明書が 2026-11-17 に切れたまま
+# 更新されないため、並行運用しながら移行する。raspiwol.ini に [mqtt2] が無ければ無効で、従来どおり動く。
+# この経路の失敗が Beebotte 側に波及しないこと（Pi は壊れると現地対応になる）。
+# 設定の読み損ね（"%" を含む値の補間エラー等）で起動不能にならないよう、raw で読み、失敗したら新経路だけ無効にする。
+try:
+    MQ2_HOST = cfg.get("mqtt2", "host",     fallback="", raw=True).strip()
+    MQ2_PATH = cfg.get("mqtt2", "path",     fallback="/mqtt", raw=True).strip()
+    MQ2_USER = cfg.get("mqtt2", "user",     fallback="pi", raw=True).strip()
+    MQ2_PASS = cfg.get("mqtt2", "password", fallback="", raw=True).strip()
+    POWER_IP = cfg.get("mqtt2", "power_ip",
+                       fallback=cfg.get("nightwatch", "target_ip", fallback="", raw=True), raw=True).strip()
+except Exception as _e:
+    print(f"WARNING: [mqtt2] unreadable, self-hosted broker disabled: {_e}", file=sys.stderr)
+    MQ2_HOST = MQ2_PATH = MQ2_USER = MQ2_PASS = POWER_IP = ""
+MQ2_ENABLED  = bool(MQ2_HOST and MQ2_PASS)
+POWER_SEC      = 30    # 電源状態を置く間隔
+POWER_FAST_SEC = 3     # WOL を受けた直後はこの間隔に縮める（Wake の反映を速く見せる）
+POWER_FAST_FOR = 120   # 縮める時間
+
 # name (lowercase) → mac
 devices: dict[str, str] = {}
 try:
@@ -246,9 +265,77 @@ mq = mqtt.Client(
 mq.username_pw_set(MQTT_TOKEN)
 mq.will_set(TOPIC_LOG, json.dumps({"data": "offline"}), retain=True)
 
+mq2 = None             # 自前ブローカーのクライアント（start_mq2 が作る。無効なら None のまま）
+_power_fast_until = 0.0   # この時刻までは電源状態を POWER_FAST_SEC ごとに置く
+_power_wake = threading.Event()   # WOL を受けたら立てて、power_loop の待ちを切り上げさせる
+
+
+def _mq2_client(client_id: str):
+    c = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                    client_id=client_id, transport="websockets")
+    c.ws_set_options(path=MQ2_PATH)
+    c.tls_set()                       # Let's Encrypt。検証あり
+    c.username_pw_set(MQ2_USER, MQ2_PASS)
+    return c
+
+
+def mq2_read_retained(topic: str, timeout: float = 5.0):
+    """自前ブローカーの retained 値（data）を読む。無効・接続失敗・未設定なら None。
+    単発実行（wake / nightwatch）用に、その場で接続して切る。"""
+    if not MQ2_ENABLED:
+        return None
+    got: list = []
+    done = threading.Event()
+
+    def on_connect(c, u, f, rc, p):
+        if rc.is_failure:
+            done.set()
+            return
+        c.subscribe(topic, qos=1)
+
+    def on_message(c, u, m):
+        if m.payload:
+            try:
+                got.append(str(json.loads(m.payload).get("data", "")))
+            except Exception:
+                got.append(m.payload.decode(errors="replace"))
+        done.set()
+
+    def worker():
+        try:
+            c = _mq2_client(f"raspiwol-oneshot-{int(time.time())}")
+            c.on_connect, c.on_message = on_connect, on_message
+            c.connect(MQ2_HOST, 443, keepalive=30)   # DNS・TCP・TLS もこのスレッドの中で待つ
+            c.loop_start()
+            done.wait(timeout)
+            c.disconnect()
+            c.loop_stop()
+        except Exception as e:
+            print(f"mq2_read_retained error: {e}", file=sys.stderr)
+        done.set()
+
+    # 接続から切断までの全体に期限をかける。過ぎたらスレッドを待たずに Beebotte へフォールバックする。
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout + 3)
+    return got[0] if got else None
+
+
+def read_autopilot_state() -> str:
+    """autopilot の値。自前ブローカーにあればそれを正とし、無ければ Beebotte、どちらも無ければ on。"""
+    v = mq2_read_retained(f"{CHANNEL}/{AUTOPILOT_RESOURCE}")
+    if v is not None:
+        return v.strip().lower()
+    return bbt_read(AUTOPILOT_RESOURCE, default="on").strip().lower()
+
 
 def pub(msg: str):
     mq.publish(TOPIC_LOG, json.dumps({"data": msg}))
+    if mq2 is not None:
+        try:
+            mq2.publish(TOPIC_LOG, json.dumps({"data": msg}))
+        except Exception as e:
+            print(f"mq2 log publish error: {e}", file=sys.stderr)
     print(f"PUB: {msg}")
 
 
@@ -342,7 +429,7 @@ def run_scheduled_wake():
     if not is_workday():
         print("scheduled_wake: 非出勤日のためスキップ")
         return
-    if bbt_read(AUTOPILOT_RESOURCE, default="on").strip().lower() == "off":
+    if read_autopilot_state() == "off":
         print("scheduled_wake: autopilot OFF のためスキップ")
         return
     mac = devices.get(WAKE_TARGET)
@@ -372,7 +459,7 @@ def run_nightwatch():
 
     # 2. autopilot チェック。"off" なら skip。read 失敗時は default "on"（=続行）。
     #    Beebotte が死んでいる時こそ pcsleep_agent も止まっている可能性があるため。
-    if bbt_read(AUTOPILOT_RESOURCE, default="on").strip().lower() == "off":
+    if read_autopilot_state() == "off":
         print("nightwatch: autopilot=off, skip")
         return
 
@@ -427,12 +514,14 @@ def handle(data: str):
         mac = devices[cmd]
         ok = send_wol(mac)
         pub(f"{'wol_ok' if ok else 'wol_fail'}: {cmd} ({mac})")
+        _power_speed_up()
         return
 
     # MAC アドレス直接指定
     if len(cmd.replace(":", "").replace("-", "")) == 12:
         ok = send_wol(cmd)
         pub(f"{'wol_ok' if ok else 'wol_fail'}: {cmd}")
+        _power_speed_up()
         return
 
     if cmd == "status":
@@ -492,26 +581,46 @@ def handle(data: str):
         if not UPDATE_URL:
             pub("update_url not set in raspiwol.ini")
             return
-        pub("update: downloading")
-        tmp = SCRIPT_DEST.with_suffix(".tmp")
+        # 新旧どちらのブローカーからも来うるので、書き込み・rename・再マウントを重ねない
+        if not _update_lock.acquire(blocking=False):
+            pub("update: already running")
+            return
         try:
-            remount_boot(rw=True)
-            req = urllib.request.Request(UPDATE_URL)
-            if UPDATE_GITHUB_TOKEN:
-                req.add_header("Authorization", f"token {UPDATE_GITHUB_TOKEN}")
-            with urllib.request.urlopen(req) as resp:
-                tmp.write_bytes(resp.read())
-            tmp.rename(SCRIPT_DEST)
-            remount_boot(rw=False)
-            pub("update: saved, restarting service")
-            subprocess.Popen(["systemctl", "restart", "raspiwol"])
-        except Exception as e:
-            pub(f"update_fail: {e}")
-            tmp.unlink(missing_ok=True)
-            remount_boot(rw=False)
+            _do_update()
+        finally:
+            _update_lock.release()
         return
 
     pub(f"unknown_command: {cmd}")
+
+
+_update_lock = threading.Lock()
+
+
+def _do_update():
+    pub("update: downloading")
+    tmp = SCRIPT_DEST.with_suffix(".tmp")
+    try:
+        remount_boot(rw=True)
+        req = urllib.request.Request(UPDATE_URL)
+        if UPDATE_GITHUB_TOKEN:
+            req.add_header("Authorization", f"token {UPDATE_GITHUB_TOKEN}")
+        with urllib.request.urlopen(req, timeout=30) as resp:   # 止まってロックを握り続けないように
+            body = resp.read()
+        # 差し替える前に中身を確かめる。HTML のエラーページや空・壊れたファイルで再起動すると
+        # 遠隔では戻せなくなる（Pi は現地対応になる）
+        if len(body) < 1000:
+            raise ValueError(f"downloaded file too small ({len(body)} bytes)")
+        compile(body, str(SCRIPT_DEST), "exec")             # SyntaxError ならここで止まる
+        tmp.write_bytes(body)
+        tmp.replace(SCRIPT_DEST)
+        remount_boot(rw=False)
+        pub("update: saved, restarting service")
+        subprocess.Popen(["systemctl", "restart", "raspiwol"])
+    except Exception as e:
+        pub(f"update_fail: {e}")
+        tmp.unlink(missing_ok=True)
+        remount_boot(rw=False)
 
 
 def on_connect(client, userdata, connect_flags, reason_code, properties):
@@ -534,6 +643,90 @@ def on_message(client, userdata, msg):
 
 mq.on_connect = on_connect
 mq.on_message = on_message
+
+
+# ── 自前ブローカー（並行運用）──────────────────────────────────────────────────
+# paho の loop_start が自分のスレッドで再接続する。Beebotte の loop_forever には触れない。
+# コールバックは自分の例外を握りつぶし、Beebotte 側を巻き込まない。
+
+def _power_speed_up():
+    global _power_fast_until
+    _power_fast_until = time.time() + POWER_FAST_FOR
+    _power_wake.set()
+
+
+def mq2_on_connect(client, userdata, connect_flags, reason_code, properties):
+    try:
+        if reason_code.is_failure:
+            print(f"mq2: connect refused ({reason_code})", file=sys.stderr)
+            return
+        client.subscribe(TOPIC_CMD, qos=0)
+        print(f"mq2: connected to {MQ2_HOST}, subscribed {TOPIC_CMD}")
+        client.publish(TOPIC_LOG, json.dumps({"data": f"connected ip={local_ip()}"}))
+    except Exception as e:
+        print(f"mq2 on_connect error: {e}", file=sys.stderr)
+
+
+def mq2_on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+    print(f"mq2: disconnected ({reason_code}); paho will reconnect", file=sys.stderr)
+
+
+def mq2_on_message(client, userdata, msg):
+    try:
+        # コマンドは retained にしない約束。万一 retained で置かれていたら、再接続のたびに
+        # reboot や pwrbtn_10s が遅れて実行されてしまうので、受け取る側でも捨てる。
+        if msg.retain:
+            print(f"mq2: retained command ignored: {msg.payload[:60]!r}", file=sys.stderr)
+            return
+        on_message(client, userdata, msg)
+    except Exception as e:
+        print(f"mq2 on_message error: {e}", file=sys.stderr)
+
+
+def power_loop():
+    """POWER_IP へ ping して、結果を自前ブローカーの power に retained で置く。
+    ダッシュボードは受け取った時刻で鮮度を判定するので、本文の ts は表示用（Pi は RTC が無い）。
+    journal が RAM 上なので、ログは状態が変わったときだけ出す。"""
+    last = None
+    while True:
+        try:
+            r = subprocess.run(["ping", "-c", "2", "-W", "1", POWER_IP], capture_output=True)
+            state = "up" if r.returncode == 0 else "down"
+            if state != last:
+                print(f"power: {POWER_IP} {state}")
+                last = state
+            if mq2 is not None and mq2.is_connected():
+                mq2.publish(f"{CHANNEL}/{POWER_RESOURCE}",
+                            json.dumps({"data": state, "ts": int(time.time() * 1000)}),
+                            qos=0, retain=True)
+        except Exception as e:
+            print(f"power_loop error: {e}", file=sys.stderr)
+        fast = time.time() < _power_fast_until
+        _power_wake.wait(POWER_FAST_SEC if fast else POWER_SEC)
+        _power_wake.clear()
+
+
+def start_mq2():
+    """自前ブローカーへの接続と電源状態の送信を始める。無効なら何もしない。"""
+    global mq2
+    if not MQ2_ENABLED:
+        print("mq2: [mqtt2] not configured -- self-hosted broker disabled")
+        return
+    try:
+        c = _mq2_client("raspiwol")
+        c.on_connect, c.on_disconnect, c.on_message = (
+            mq2_on_connect, mq2_on_disconnect, mq2_on_message)
+        c.reconnect_delay_set(min_delay=1, max_delay=60)
+        c.connect_async(MQ2_HOST, 443, keepalive=60)
+        c.loop_start()
+        mq2 = c
+        if POWER_IP and _valid_ipv4(POWER_IP):
+            threading.Thread(target=power_loop, daemon=True).start()
+        else:
+            print("mq2: power_ip not set -- power status disabled", file=sys.stderr)
+    except Exception as e:
+        mq2 = None
+        print(f"mq2: start failed (Beebotte path unaffected): {e}", file=sys.stderr)
 
 
 def _setup_signal_handler():
@@ -559,6 +752,7 @@ def main():
         return
     _setup_signal_handler()
     print(f"raspiwol start | devices={list(devices.keys())} | ip={local_ip()}")
+    start_mq2()
     while True:
         try:
             mq.connect(MQTT_HOST, MQTT_PORT, keepalive=60)

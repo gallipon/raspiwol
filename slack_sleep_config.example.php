@@ -17,3 +17,6 @@ const TARGET_CHANNEL   = "C0FILL_ME";     // 勤怠チャンネルの ID（非�
 const TARGET_USER      = "U0FILL_ME";     // 自分の Slack member ID
 const TRIGGER          = "終了";           // 本文に含まれていれば発火（部分一致）
 const STATE_FILE       = "/var/lib/raspiwol/slack_last_ts";  // 最後に見た ts（cron 実行ユーザーが書込み可なパス）
+// 自前ブローカー（VPS の Mosquitto、ユーザー slack）のパスワード。書けば autopilot の読み取りと
+// 指示の送信がそちらになる（失敗時は Beebotte へ送り直す）。書かなければ従来どおり Beebotte。
+// const MQTT_SLACK_PASS = "FILL_ME";
